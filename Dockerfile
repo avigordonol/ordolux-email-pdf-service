@@ -1,21 +1,15 @@
-# OrdoLux Email→PDF microservice (Python venv + Node)
 FROM node:20-slim
 
-ENV NODE_ENV=production \
-    DEBIAN_FRONTEND=noninteractive \
-    LANG=C.UTF-8
-
-# Python + venv + certs
+# System deps for Python tooling
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-venv python3-pip ca-certificates \
- && rm -rf /var/lib/apt/lists/*
+  && rm -rf /var/lib/apt/lists/*
 
-# Isolated Python env (avoids PEP 668 issues)
+# Isolated Python env (avoids PEP 668 issue)
 RUN python3 -m venv /opt/pyenv
 ENV PATH="/opt/pyenv/bin:${PATH}"
 
-# Python deps inside venv
-# NOTE: extract_msg 0.55.0 exists on PyPI; 0.47.6 does NOT.
+# Python libs for MSG parsing
 RUN pip install --upgrade pip && pip install --no-cache-dir \
     extract_msg==0.55.0 \
     olefile==0.47 \
@@ -26,13 +20,13 @@ RUN pip install --upgrade pip && pip install --no-cache-dir \
 
 WORKDIR /app
 
-# Install Node deps (prod only)
+# Install Node deps first for caching
 COPY package.json ./
 RUN npm install --omit=dev
 
 # App code
 COPY server.js ./
-COPY msg2eml.py ./
+COPY py/ ./py/
 
-EXPOSE 8080
+ENV PORT=3000
 CMD ["node", "server.js"]
