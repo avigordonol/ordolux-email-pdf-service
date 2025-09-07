@@ -7,61 +7,47 @@ import he from 'he';
 import { PDFDocument } from 'pdf-lib';
 
 const app = express();
-app.use(express.json({ limit: '25mb' })); // supports big base64 payloads
+const PORT = process.env.PORT || 3000;
 
-// ---------------- Auth ----------------
+// ---------- Auth ----------
 const SHARED_SECRET = process.env.SHARED_SECRET || 'dev-secret';
-
-// Optional HMAC header names, keep both for easier client tests
-const SIG_HEX = 'x-ordolux-signature';          // e.g. sha256=<hex>
-const SIG_B64 = 'x-ordolux-signature-base';     // e.g. sha256_b64=<b64>
-const SECRET_HDR = 'x-ordolux-secret';          // raw shared secret
+const SECRET_HDR = 'x-ordolux-secret';
+const SIG_HEX = 'x-ordolux-signature';          // sha256=<hex>
+const SIG_B64 = 'x-ordolux-signature-base';     // sha256_b64=<base64>
 
 function verify(req, rawBody) {
-  // 1) shared-secret must match
+  // Require the shared secret
   const s = req.headers[SECRET_HDR] || '';
   if (s !== SHARED_SECRET) return false;
 
-  // 2) if a signature is provided, accept when valid (but don’t require)
-  const hmac = crypto.createHmac('sha256', SHARED_SECRET);
-  hmac.update(rawBody);
-  const hex = 'sha256=' + hmac.digest('hex');
+  // If a signature header is provided, ensure it matches; otherwise allow
+  if (req.headers[SIG_HEX] || req.headers[SIG_B64]) {
+    const h = crypto.createHmac('sha256', SHARED_SECRET).update(rawBody).digest();
+    const hex = 'sha256=' + h.toString('hex');
+    const b64 = 'sha256_b64=' + h.toString('base64');
 
-  if (req.headers[SIG_HEX] && req.headers[SIG_HEX] !== hex) {
-    // Try b64 variant if sent
-    if (req.headers[SIG_B64]) {
-      const hmac2 = crypto.createHmac('sha256', SHARED_SECRET);
-      hmac2.update(rawBody);
-      const b64 = 'sha256_b64=' + hmac2.digest('base64');
-      if (req.headers[SIG_B64] !== b64) return false;
-    } else {
-      return false;
-    }
+    if (req.headers[SIG_HEX] && req.headers[SIG_HEX] !== hex) return false;
+    if (req.headers[SIG_B64] && req.headers[SIG_B64] !== b64) return false;
   }
   return true;
 }
 
-// Raw body capture for HMAC
-app.use((req, res, next) => {
-  if (req.method !== 'POST' || req.path !== '/convert') return next();
-  let buf = Buffer.alloc(0);
-  req.on('data', (chunk) => (buf = Buffer.concat([buf, chunk])));
-  req.on('end', () => {
-    req.rawBody = buf;
-    try {
-      req.body = JSON.parse(buf.toString('utf8'));
-    } catch {
-      return res.status(400).json({ ok: false, error: 'Invalid JSON' });
-    }
-    next();
-  });
+// ---------- Body parsing (order matters!) ----------
+// 1) Capture raw body for /convert (so HMAC works)
+app.use('/convert', express.raw({ type: '*/*', limit: '25mb' }), (req, res, next) => {
+  req.rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || '');
+  try {
+    req.body = JSON.parse(req.rawBody.toString('utf8'));
+  } catch {
+    return res.status(400).json({ ok: false, error: 'Invalid JSON' });
+  }
+  next();
 });
 
-// ---------------- Utilities ----------------
-function isPlaceholder(htmlOrText) {
-  const s = stripHtml(htmlOrText).toLowerCase();
-  return s.includes('converted from outlook') && s.includes('open the original message in outlook');
-}
+// 2) Normal JSON parser for other routes
+app.use(express.json({ limit: '1mb' }));
+
+// ---------- Small helpers ----------
 function stripHtml(html = '') {
   let s = String(html);
   s = s.replace(/<\s*script[\s\S]*?<\/\s*script\s*>/gi, '');
@@ -72,6 +58,10 @@ function stripHtml(html = '') {
   s = he.decode(s);
   s = s.replace(/\r/g, '').replace(/\n{3,}/g, '\n\n').trim();
   return s;
+}
+function isPlaceholder(t) {
+  const s = stripHtml(t || '').toLowerCase();
+  return s.includes('converted from outlook') && s.includes('open the original message');
 }
 function rtfToText(rtf) {
   try {
@@ -118,63 +108,64 @@ function addWrapped(doc, text, x, y, maxWidth, lineHeight) {
   }
   return y;
 }
-async function mergePdfBytes(mainPdfBytes, pdfBytesArray) {
+async function mergePdfBytes(mainPdf, others) {
   const out = await PDFDocument.create();
-  const mainDoc = await PDFDocument.load(mainPdfBytes);
-  const mainPages = await out.copyPages(mainDoc, mainDoc.getPageIndices());
-  mainPages.forEach(p => out.addPage(p));
-
-  for (const b of pdfBytesArray) {
+  const first = await PDFDocument.load(mainPdf);
+  const pages = await out.copyPages(first, first.getPageIndices());
+  pages.forEach(p => out.addPage(p));
+  for (const b of others) {
     try {
       const d = await PDFDocument.load(b);
-      const pages = await out.copyPages(d, d.getPageIndices());
-      pages.forEach(p => out.addPage(p));
+      const ps = await out.copyPages(d, d.getPageIndices());
+      ps.forEach(p => out.addPage(p));
     } catch { /* skip bad pdf */ }
   }
   return await out.save();
 }
-
-// ---------------- Parsers ----------------
-async function parseEML(buffer) {
-  const parsed = await simpleParser(buffer);
-  const meta = {
-    Subject: parsed.subject || '',
-    From: parsed.from?.text || '',
-    To: parsed.to?.text || '',
-    Cc: parsed.cc?.text || '',
-    Date: parsed.date ? new Date(parsed.date).toISOString() : ''
-  };
-
-  let bodyHtml = parsed.html || '';
-  let bodyText = parsed.text || '';
-
-  let text = bodyText || stripHtml(bodyHtml);
-  if (isPlaceholder(bodyHtml || bodyText)) text = '';
-
-  const atts = [];
-  for (const a of parsed.attachments || []) {
-    atts.push({
-      filename: a.filename || 'attachment',
-      contentType: a.contentType || 'application/octet-stream',
-      bytes: a.content // Buffer
-    });
-  }
-  return { meta, text: quality(text), attachments: atts };
+function guessType(name = '') {
+  const n = name.toLowerCase();
+  if (n.endsWith('.pdf')) return 'application/pdf';
+  if (n.endsWith('.eml')) return 'message/rfc822';
+  if (n.endsWith('.msg')) return 'application/vnd.ms-outlook';
+  if (n.endsWith('.html') || n.endsWith('.htm')) return 'text/html';
+  if (n.endsWith('.txt')) return 'text/plain';
+  return 'application/octet-stream';
 }
 
-function parseMSG(buffer) {
-  const mr = new MsgReader(buffer);
+// ---------- Parsers ----------
+async function parseEML(buf) {
+  const p = await simpleParser(buf);
+  const meta = {
+    Subject: p.subject || '',
+    From: p.from?.text || '',
+    To: p.to?.text || '',
+    Cc: p.cc?.text || '',
+    Date: p.date ? new Date(p.date).toISOString() : ''
+  };
+  const html = p.html || '';
+  const plain = p.text || '';
+  let text = plain || stripHtml(html);
+  if (isPlaceholder(html || plain)) text = '';
+
+  const attachments = (p.attachments || []).map(a => ({
+    filename: a.filename || 'attachment',
+    contentType: a.contentType || 'application/octet-stream',
+    bytes: Buffer.from(a.content)
+  }));
+  return { meta, text: quality(text), attachments };
+}
+function parseMSG(buf) {
+  const mr = new MsgReader(buf);
   const data = mr.getFileData();
 
   const from =
-    (data.senderName || '') +
-    (data.senderEmail ? ` <${data.senderEmail}>` : '');
-
-  let to = '';
-  if (Array.isArray(data.recipients)) {
-    const arr = data.recipients.map(r => (r.name || '') + (r.email ? ` <${r.email}>` : '')).filter(Boolean);
-    to = arr.join(', ');
-  }
+    (data.senderName || '') + (data.senderEmail ? ` <${data.senderEmail}>` : '');
+  const to = Array.isArray(data.recipients)
+    ? data.recipients
+        .map(r => (r.name || '') + (r.email ? ` <${r.email}>` : ''))
+        .filter(Boolean)
+        .join(', ')
+    : '';
 
   const meta = {
     Subject: data.subject || data.headers?.subject || '',
@@ -188,16 +179,14 @@ function parseMSG(buffer) {
   const plain = data.body || '';
   const rtf = data.bodyRTF || '';
   let text = plain || stripHtml(html) || (rtf.startsWith('{\\rtf') ? rtfToText(rtf) : '');
-
   if (isPlaceholder(html || plain)) text = '';
 
-  // attachments (get raw bytes via getAttachment)
-  const atts = [];
+  const attachments = [];
   if (typeof mr.getAttachment === 'function' && Array.isArray(data.attachments)) {
     for (let i = 0; i < data.attachments.length; i++) {
       const raw = mr.getAttachment(i); // { fileName, content: Uint8Array }
       if (raw?.content?.byteLength) {
-        atts.push({
+        attachments.push({
           filename: raw.fileName || 'attachment',
           contentType: guessType(raw.fileName),
           bytes: Buffer.from(raw.content.buffer, raw.content.byteOffset, raw.content.byteLength)
@@ -205,25 +194,15 @@ function parseMSG(buffer) {
       }
     }
   }
-  return { meta, text: quality(text), attachments: atts };
+  return { meta, text: quality(text), attachments };
 }
 
-function guessType(name = '') {
-  const n = name.toLowerCase();
-  if (n.endsWith('.pdf')) return 'application/pdf';
-  if (n.endsWith('.txt')) return 'text/plain';
-  if (n.endsWith('.html') || n.endsWith('.htm')) return 'text/html';
-  if (n.endsWith('.eml')) return 'message/rfc822';
-  if (n.endsWith('.msg')) return 'application/vnd.ms-outlook';
-  return 'application/octet-stream';
-}
-
-// ---------------- Routes ----------------
+// ---------- Routes ----------
 app.get('/healthz', (req, res) => res.json({ ok: true }));
 
 app.post('/convert', async (req, res) => {
   try {
-    if (!verify(req, req.rawBody)) {
+    if (!verify(req, req.rawBody || Buffer.alloc(0))) {
       return res.status(401).json({ ok: false, error: 'Invalid signature' });
     }
 
@@ -245,52 +224,41 @@ app.post('/convert', async (req, res) => {
     let parsed;
     if (lower.endsWith('.eml')) parsed = await parseEML(bytes);
     else if (lower.endsWith('.msg')) parsed = parseMSG(bytes);
-    else {
-      // best effort: try EML first, then MSG
-      try { parsed = await parseEML(bytes); } catch { parsed = parseMSG(bytes); }
-    }
+    else { try { parsed = await parseEML(bytes); } catch { parsed = parseMSG(bytes); } }
 
     if (!parsed || !parsed.text) {
-      return res.status(422).json({
-        ok: false,
-        error: 'No safe human-readable body found',
-      });
+      return res.status(422).json({ ok: false, error: 'No safe human-readable body found' });
     }
 
-    // 1) render the email body
-    const bodyPdf = renderEmailPDF({
-      title: parsed.meta.Subject || '(no subject)',
-      meta: { From: parsed.meta.From || '', To: parsed.meta.To || '', Cc: parsed.meta.Cc || '', Date: parsed.meta.Date || '' },
-      bodyText: parsed.text
-    });
+    // Email body → PDF
+    const bodyPdf = Buffer.from(
+      renderEmailPDF({
+        title: parsed.meta.Subject || '(no subject)',
+        meta: { From: parsed.meta.From || '', To: parsed.meta.To || '', Cc: parsed.meta.Cc || '', Date: parsed.meta.Date || '' },
+        bodyText: parsed.text
+      })
+    );
 
-    let finalPdfBytes = Buffer.from(bodyPdf);
+    let outPdf = bodyPdf;
 
-    // 2) merge PDF attachments if requested
+    // Merge PDF attachments if requested
     if (options.mergeAttachments && parsed.attachments?.length) {
-      const pdfParts = parsed.attachments
-        .filter(a => (a.contentType || '').toLowerCase() === 'application/pdf' || a.filename?.toLowerCase().endsWith('.pdf'))
+      const pdfs = parsed.attachments
+        .filter(a => (a.contentType || '').toLowerCase() === 'application/pdf' || (a.filename || '').toLowerCase().endsWith('.pdf'))
         .map(a => a.bytes);
 
-      if (pdfParts.length) {
-        finalPdfBytes = Buffer.from(await mergePdfBytes(finalPdfBytes, pdfParts));
-      }
+      if (pdfs.length) outPdf = Buffer.from(await mergePdfBytes(outPdf, pdfs));
     }
 
     res.setHeader('Content-Type', 'application/pdf');
-    // stream back
-    return res.status(200).end(finalPdfBytes);
-
-  } catch (err) {
-    console.error(err);
+    return res.status(200).end(outPdf);
+  } catch (e) {
+    console.error(e);
     const wantsJson = (req.headers['accept'] || '').includes('application/json');
-    const msg = String(err?.message || err);
-    return wantsJson
-      ? res.status(500).json({ ok: false, error: msg })
-      : res.status(500).end(msg);
+    const msg = String(e?.message || e);
+    return wantsJson ? res.status(500).json({ ok: false, error: msg }) : res.status(500).end(msg);
   }
 });
 
-// ---------------- Start ----------------
-const PORT = process.env.PORT || 3000;
+// ---------- Start ----------
 app.listen(PORT, () => console.log('Email→PDF service listening on ' + PORT));
