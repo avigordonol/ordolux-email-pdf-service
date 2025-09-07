@@ -1,6 +1,6 @@
 {
   "name": "ordolux-email-pdf-service",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Convert EML/MSG to PDF for OrdoLux",
   "main": "server.js",
   "type": "commonjs",
