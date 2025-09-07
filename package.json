@@ -1,13 +1,16 @@
 {
   "name": "ordolux-email-pdf-service",
-  "version": "1.0.0",
+  "version": "0.2.0",
   "type": "module",
-  "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "express": "4.19.2",
-    "jspdf": "2.5.1"
+    "jspdf": "2.5.1",
+    "mailparser": "3.6.7",
+    "msgreader": "1.0.8",
+    "pdf-lib": "1.17.1",
+    "he": "1.2.0"
   }
 }
