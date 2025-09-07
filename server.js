@@ -1,217 +1,165 @@
-// OrdoLux Email→PDF microservice (EML + MSG via Python extract_msg)
-// Auth: header X-Ordolux-Secret must equal process.env.SHARED_SECRET
-// Endpoints:
-//   GET  /healthz -> { ok: true }
-//   GET  /diag    -> { ok:true, node, secretSet, python:"ok"|"missing" }
-//   POST /convert { fileBase64, filename, options? } -> PDF (Accept: application/pdf) or JSON (Accept: application/json)
+// server.js — Safe EML converter + graceful MSG 422
+// ESM-compatible (package.json has "type":"module")
 
-const express    = require('express');
-const bodyParser = require('body-parser');
-const fs         = require('fs');
-const fsp        = fs.promises;
-const os         = require('os');
-const path       = require('path');
-const { execFile } = require('child_process');
-const { simpleParser } = require('mailparser');
-const { htmlToText }  = require('html-to-text');
-const PDFDocument     = require('pdfkit');
+import express from 'express';
+import PDFDocument from 'pdfkit';
+import { simpleParser } from 'mailparser';
 
-const PORT = process.env.PORT || 8080;
-const SHARED_SECRET = process.env.SHARED_SECRET || '';
+// --- config/secrets ---
+const PORT = process.env.PORT || 3000;
+const SHARED_SECRET = process.env.SHARED_SECRET; // set in Railway env
 
+// --- app ---
 const app = express();
-app.use(bodyParser.json({ limit: '50mb' }));
+// allow big-ish emails; adjust if needed
+app.use(express.json({ limit: '25mb' }));
 
-function sendError(res, code, msg, details) {
-  const asJson = (res.req.headers.accept || '').includes('application/json');
-  const payload = { ok: false, error: msg };
-  if (details) payload.details = details;
-  if (asJson) return res.status(code).json(payload);
-  return res.status(code).type('text/plain').send(JSON.stringify(payload));
+// small helper
+function wantPdf(req) {
+  const a = (req.headers['accept'] || '').toLowerCase();
+  return a.includes('application/pdf');
+}
+
+function errJson(res, status, msg, extra = {}) {
+  return res.status(status).json({ ok: false, error: msg, ...extra });
 }
 
 app.get('/healthz', (req, res) => {
-  if (!SHARED_SECRET) return res.status(500).json({ ok: false, error: 'Missing SHARED_SECRET' });
+  if (SHARED_SECRET && req.headers['x-ordolux-secret'] !== SHARED_SECRET) {
+    return errJson(res, 401, 'unauthorized');
+  }
   res.json({ ok: true });
 });
 
-app.get('/diag', (req, res) => {
-  const diag = { ok: true, node: process.version, secretSet: !!SHARED_SECRET, python: "missing" };
-  execFile('python3', ['--version'], { timeout: 4000 }, (err) => {
-    if (!err) diag.python = "ok";
-    res.json(diag);
-  });
-});
-
+// --- /convert ---
+// Accepts:
+//  { fileBase64: <base64>, filename: "name.eml" | "name.msg", options?: { mergeAttachments?: boolean } }
+// Returns:
+//  - PDF binary when Accept: application/pdf (EML only in this build)
+//  - JSON {ok:false,...} errors for invalid/MSG/etc.
 app.post('/convert', async (req, res) => {
-  // Auth
-  const secret = req.header('X-Ordolux-Secret') || '';
-  if (!SHARED_SECRET || secret !== SHARED_SECRET) {
-    return sendError(res, 401, 'Unauthorized');
-  }
-
-  const accept = (req.headers.accept || '').toLowerCase();
-  const wantsPdf  = accept.includes('application/pdf');
-  const wantsJson = accept.includes('application/json');
-
-  const { fileBase64, filename, fileUrl, options } = req.body || {};
-  if (!fileBase64 && !fileUrl) return sendError(res, 400, 'Provide fileBase64 or fileUrl');
-  if (!filename) return sendError(res, 400, 'Provide filename');
-
-  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'ordolux-'));
-  const cleanup = async () => { try { await fsp.rm(tmpDir, { recursive: true, force: true }); } catch {} };
-
-  const logs = [];
   try {
-    // Acquire bytes (this build only supports base64 to keep things simple)
-    let bytes;
-    if (fileBase64) {
-      try {
-        bytes = Buffer.from(fileBase64, 'base64');
-      } catch (e) {
-        return sendError(res, 400, 'Invalid base64', String(e && e.message || e));
-      }
-    } else {
-      return sendError(res, 400, 'fileUrl not supported in this build (use fileBase64)');
+    // auth
+    if (SHARED_SECRET && req.headers['x-ordolux-secret'] !== SHARED_SECRET) {
+      return errJson(res, 401, 'Invalid secret');
     }
 
-    const ext = (path.extname(filename || '') || '').toLowerCase();
-    const srcPath = path.join(tmpDir, `upload${ext || ''}`);
-    await fsp.writeFile(srcPath, bytes);
-
-    // If MSG → use Python extract_msg to produce an EML
-    let emlPath = null;
-    if (ext === '.msg') {
-      logs.push('detected .msg; invoking msg2eml.py (extract_msg)');
-      const outPath = path.join(tmpDir, 'converted.eml');
-
-      // quick python check
-      const pyOk = await new Promise((resolve) => {
-        execFile('python3', ['-c', 'import extract_msg'], { timeout: 5000 }, (err) => resolve(!err));
-      });
-      if (!pyOk) {
-        return sendError(res, 500,
-          'Python extract_msg not available in container. Please redeploy with correct Dockerfile.',
-          { logs });
-      }
-
-      await new Promise((resolve, reject) => {
-        execFile('python3', ['/app/msg2eml.py', srcPath, outPath], { timeout: 45000 }, (err, _stdout, stderr) => {
-          if (err) {
-            logs.push(`msg2eml.py failed: ${stderr || String(err)}`);
-            return reject(new Error('MSG→EML conversion failed (file may be corrupt/unsupported)'));
-          }
-          resolve();
-        });
-      });
-      emlPath = outPath;
-    } else if (ext === '.eml') {
-      emlPath = srcPath;
-    } else {
-      // Not an email: return a stub PDF so the pipeline remains testable
-      const pdf = renderStubPDF(filename, bytes.length);
-      if (wantsJson) return res.json({ ok: true, route: 'stub-non-email', bytes: bytes.length, logs });
-      res.type('application/pdf').send(pdf);
-      return;
+    const { fileBase64, filename = '', options = {} } = req.body || {};
+    if (!fileBase64 || !filename) {
+      return errJson(res, 400, 'Missing fileBase64 or filename');
     }
 
-    // Parse EML
-    let parsed;
+    // basic filename checks
+    const lower = String(filename).toLowerCase().trim();
+    const isEML = lower.endsWith('.eml');
+    const isMSG = lower.endsWith('.msg');
+
+    // For now, MSG is not enabled in this image — return clean 422 (no crash)
+    if (isMSG) {
+      return errJson(res, 422,
+        'MSG not enabled in this build. The service supports EML now. ' +
+        'We can enable MSG next via a Python-backed parser, or you can upload the MIME (.eml) form.');
+    }
+
+    if (!isEML) {
+      return errJson(res, 400, 'Unsupported extension; send .eml (or .msg once enabled).');
+    }
+
+    // decode base64
+    let raw;
     try {
-      const emlBuf = await fsp.readFile(emlPath);
-      parsed = await simpleParser(emlBuf);
+      raw = Buffer.from(fileBase64, 'base64');
+    } catch {
+      return errJson(res, 400, 'Invalid base64');
+    }
+
+    // parse EML
+    let mail;
+    try {
+      mail = await simpleParser(raw);
     } catch (e) {
-      logs.push('simpleParser error: ' + (e && e.message || e));
-      return sendError(res, 422, 'Failed to parse EML after conversion', { logs });
+      return errJson(res, 422, 'Failed to parse EML', { detail: String(e?.message || e) });
     }
 
-    // Extract fields
-    const subject = parsed.subject || '(no subject)';
-    const from    = parsed.from ? parsed.from.text : '';
-    const to      = parsed.to   ? parsed.to.text   : '';
-    const cc      = parsed.cc   ? parsed.cc.text   : '';
-    const date    = parsed.date ? new Date(parsed.date).toISOString()
-                                : (parsed.headers && parsed.headers.get && parsed.headers.get('date')) || '';
+    // pick a body
+    const textBody = (mail.text || '').trim();
+    const htmlBody = (mail.html && typeof mail.html === 'string') ? mail.html : '';
+    const body = textBody || stripHtml(htmlBody) || '(no body)';
 
-    // Prefer HTML→text; fallback to text
-    let bodyText = '';
-    if (parsed.html) {
-      try {
-        bodyText = htmlToText(parsed.html, {
-          wordwrap: 100,
-          selectors: [
-            { selector: 'a', options: { hideLinkHrefIfSameAsText: true } },
-            { selector: 'img', format: 'skip' }
-          ]
-        });
-      } catch {}
+    // render to PDF
+    const pdf = new PDFDocument({ size: 'A4', margin: 40 });
+    res.setHeader('Content-Type', wantPdf(req) ? 'application/pdf' : 'application/pdf');
+    // Content-Disposition: inline so browsers render; change to attachment if you prefer downloads
+    res.setHeader('Content-Disposition', `inline; filename="${safePdfName(filename)}"`);
+
+    pdf.pipe(res);
+
+    pdf.fontSize(18).text(mail.subject || '(no subject)', { underline: false });
+    pdf.moveDown(0.5);
+
+    // headers block
+    pdf.fontSize(10);
+    const hdrs = [
+      ['From', showAddr(mail.from)],
+      ['To', showAddrs(mail.to)],
+      ['Cc', showAddrs(mail.cc)],
+      ['Date', mail.date ? new Date(mail.date).toString() : '']
+    ];
+    hdrs.forEach(([k, v]) => { if (v) pdf.text(`${k}: ${v}`); });
+    pdf.moveDown(0.5);
+    pdf.moveTo(pdf.x, pdf.y).lineTo(pdf.page.width - pdf.page.margins.right, pdf.y).stroke();
+    pdf.moveDown(0.75);
+
+    // body
+    pdf.fontSize(12).text(body, { align: 'left' });
+
+    // NOTE: attachments merging is not implemented in this build
+    if (options && options.mergeAttachments) {
+      pdf.addPage().fontSize(11).text('Attachments merging is not enabled in this build.', { align: 'left' });
     }
-    if (!bodyText && parsed.text) bodyText = parsed.text;
 
-    if (!bodyText || !bodyText.trim()) {
-      logs.push('No readable body after parsing');
-      return sendError(res, 422, 'No readable body found in message', { logs });
-    }
-
-    // Render PDF
-    const pdfBuffer = await renderEmailPDF({
-      title: subject,
-      meta: { From: from, To: to, Cc: cc, Date: date },
-      bodyText
-    });
-
-    if (wantsJson) return res.json({ ok: true, route: (ext === '.msg' ? 'msg(py)->eml->pdf' : 'eml->pdf'), logs });
-
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Cache-Control', 'no-store');
-    res.send(pdfBuffer);
-
+    pdf.end();
   } catch (e) {
-    return sendError(res, 500, 'Internal error', { msg: String(e && e.message || e), logs });
-  } finally {
-    await cleanup();
+    // never crash silently — always JSON
+    try {
+      return errJson(res, 500, 'Unhandled error', { detail: String(e?.message || e) });
+    } catch {
+      res.status(500).end();
+    }
   }
 });
 
-function renderStubPDF(filename, size) {
-  const doc = new PDFDocument({ size: 'A4', margin: 40 });
-  const chunks = [];
-  doc.on('data', d => chunks.push(d));
-  doc.on('end', () => {});
-  doc.fontSize(22).text('OrdoLux Email→PDF (Stub)', { underline: true });
-  doc.moveDown();
-  doc.fontSize(12).text(`Filename: ${filename}`);
-  doc.text(`Bytes: ${size}`);
-  doc.text(`Generated: ${new Date().toISOString()}`);
-  doc.end();
-  return Buffer.concat(chunks);
+// --- helpers ---
+function showAddr(addr) {
+  if (!addr) return '';
+  try {
+    if (addr.text) return addr.text;
+    if (addr.value && Array.isArray(addr.value) && addr.value.length) {
+      return addr.value.map(v => v.address ? `${v.name ? (v.name + ' ') : ''}<${v.address}>` : (v.name || '')).join(', ');
+    }
+  } catch { /* ignore */ }
+  return '';
+}
+function showAddrs(a) { return showAddr(a); }
+
+function stripHtml(html) {
+  if (!html) return '';
+  let s = String(html);
+  s = s.replace(/<\s*script[\s\S]*?<\/\s*script\s*>/gi, '');
+  s = s.replace(/<\s*style[\s\S]*?<\/\s*style\s*>/gi, '');
+  s = s.replace(/<br\s*\/?>/gi, '\n');
+  s = s.replace(/<\/p>/gi, '\n');
+  s = s.replace(/<\/li>/gi, '\n• ');
+  s = s.replace(/<[^>]+>/g, '');
+  s = s.replace(/\r/g, '').replace(/\n{3,}/g, '\n\n').trim();
+  return s;
 }
 
-function renderEmailPDF({ title, meta, bodyText }) {
-  return new Promise((resolve) => {
-    const doc = new PDFDocument({ size: 'A4', margin: 40 });
-    const chunks = [];
-    doc.on('data', d => chunks.push(d));
-    doc.on('end', () => resolve(Buffer.concat(chunks)));
-
-    doc.fontSize(18).text(title, { width: 515 });
-    doc.moveDown(0.5);
-
-    doc.fontSize(11);
-    ['From', 'To', 'Cc', 'Date'].forEach(k => {
-      const v = (meta && meta[k]) ? String(meta[k]).trim() : '';
-      if (v) doc.text(`${k}: ${v}`, { width: 515 });
-    });
-
-    doc.moveDown(0.5);
-    doc.moveTo(40, doc.y).lineTo(555, doc.y).stroke();
-    doc.moveDown();
-
-    doc.fontSize(12).text(String(bodyText || '').slice(0, 500000), { width: 515 });
-    doc.end();
-  });
+function safePdfName(name) {
+  const base = String(name || 'Email').replace(/\.[^.]+$/, '');
+  return (base || 'Email') + '.pdf';
 }
 
 app.listen(PORT, () => {
-  console.log(`OrdoLux email-pdf service listening on :${PORT}`);
+  console.log(`OrdoLux Email→PDF service listening on :${PORT}`);
 });
