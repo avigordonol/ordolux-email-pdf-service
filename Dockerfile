@@ -1,18 +1,23 @@
 # OrdoLux Email→PDF microservice (MSG via Python extract_msg -> EML -> PDF)
-
 FROM node:20-slim
 
 ENV NODE_ENV=production
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=C.UTF-8
 
-# System deps: Python + pip for extract_msg; certificates for TLS
+# System deps: Python + venv + certs
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip ca-certificates \
+    python3 python3-venv python3-pip ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-# Python libs for MSG reading (pin for reproducibility)
-RUN pip3 install --no-cache-dir \
+# Create isolated Python env (works around PEP 668), expose as python3
+RUN python3 -m venv /opt/pyenv \
+ && ln -s /opt/pyenv/bin/python /opt/pyenv/bin/python3
+ENV PATH="/opt/pyenv/bin:${PATH}"
+
+# Upgrade pip inside venv and install Python libs
+RUN pip install --upgrade pip \
+ && pip install --no-cache-dir \
     extract_msg==0.47.6 \
     olefile==0.47 \
     compressed-rtf==1.0.6 \
@@ -20,7 +25,7 @@ RUN pip3 install --no-cache-dir \
 
 WORKDIR /app
 
-# Install Node deps (no lockfile to avoid lock mismatch during first deploy)
+# Install Node deps (no lockfile needed here)
 COPY package.json ./
 RUN npm install --omit=dev
 
