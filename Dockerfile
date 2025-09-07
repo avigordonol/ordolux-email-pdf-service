@@ -1,23 +1,21 @@
-# OrdoLux Email→PDF microservice (MSG via Python extract_msg -> EML -> PDF)
+# OrdoLux Email→PDF microservice (Python venv + Node)
 FROM node:20-slim
 
-ENV NODE_ENV=production
-ENV DEBIAN_FRONTEND=noninteractive
-ENV LANG=C.UTF-8
+ENV NODE_ENV=production \
+    DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8
 
-# System deps: Python + venv + certs
+# Python + venv (PEP 668-safe) + certs
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-venv python3-pip ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-# Create isolated Python env (works around PEP 668), expose as python3
-RUN python3 -m venv /opt/pyenv \
- && ln -s /opt/pyenv/bin/python /opt/pyenv/bin/python3
+# Create isolated Python env (no global pip), add it to PATH
+RUN python3 -m venv /opt/pyenv
 ENV PATH="/opt/pyenv/bin:${PATH}"
 
-# Upgrade pip inside venv and install Python libs
-RUN pip install --upgrade pip \
- && pip install --no-cache-dir \
+# Python deps inside venv
+RUN pip install --upgrade pip && pip install --no-cache-dir \
     extract_msg==0.47.6 \
     olefile==0.47 \
     compressed-rtf==1.0.6 \
@@ -25,7 +23,7 @@ RUN pip install --upgrade pip \
 
 WORKDIR /app
 
-# Install Node deps (no lockfile needed here)
+# Install Node deps (prod only)
 COPY package.json ./
 RUN npm install --omit=dev
 
