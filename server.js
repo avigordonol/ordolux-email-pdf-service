@@ -1,13 +1,12 @@
 // OrdoLux Email→PDF microservice (EML + MSG via msgconvert)
-// - Auth: header X-Ordolux-Secret must equal process.env.SHARED_SECRET
-// - POST /convert: { fileBase64, filename, options? }
-//      -> application/pdf (default) OR application/json (if Accept: application/json)
-// - GET  /healthz: { ok: true }
-// - GET  /diag: environment diagnostics
+// Auth: header X-Ordolux-Secret must equal process.env.SHARED_SECRET
+// Endpoints:
+//   GET  /healthz -> { ok: true }
+//   GET  /diag    -> { ok:true, node, secretSet, msgconvert: "ok"|"missing" }
+//   POST /convert { fileBase64, filename, options? } -> PDF (Accept: application/pdf) or JSON (Accept: application/json)
 
 const express    = require('express');
 const bodyParser = require('body-parser');
-const crypto     = require('crypto');
 const fs         = require('fs');
 const fsp        = fs.promises;
 const os         = require('os');
@@ -23,85 +22,82 @@ const SHARED_SECRET = process.env.SHARED_SECRET || '';
 const app = express();
 app.use(bodyParser.json({ limit: '50mb' }));
 
-function fail(res, code, msg, extra) {
-  const out = { ok: false, error: msg };
-  if (extra) out.details = extra;
-  // If caller wants JSON, always send JSON
-  const wantsJson = (res.req.headers.accept || '').includes('application/json');
-  if (wantsJson) return res.status(code).json(out);
-  // Otherwise text for errors
-  return res.status(code).type('text/plain').send(JSON.stringify(out));
+function sendError(res, code, msg, details) {
+  const asJson = (res.req.headers.accept || '').includes('application/json');
+  const payload = { ok: false, error: msg };
+  if (details) payload.details = details;
+  if (asJson) return res.status(code).json(payload);
+  return res.status(code).type('text/plain').send(JSON.stringify(payload));
 }
 
 app.get('/healthz', (req, res) => {
   if (!SHARED_SECRET) return res.status(500).json({ ok: false, error: 'Missing SHARED_SECRET' });
-  return res.json({ ok: true });
+  res.json({ ok: true });
 });
 
-app.get('/diag', async (req, res) => {
-  const diag = {
-    ok: true,
-    node: process.version,
-    secretSet: !!SHARED_SECRET,
-    msgconvert: null
-  };
-  try {
-    await new Promise((resolve, reject) => {
-      execFile('msgconvert', ['--help'], { timeout: 4000 }, (err, stdout, stderr) => {
-        if (err) return resolve(); // not fatal, just absent
-        diag.msgconvert = 'ok';
-        resolve();
-      });
-    });
-  } catch {}
-  res.json(diag);
+app.get('/diag', (req, res) => {
+  const diag = { ok: true, node: process.version, secretSet: !!SHARED_SECRET, msgconvert: "missing" };
+  execFile('msgconvert', ['--version'], { timeout: 4000 }, (err) => {
+    if (!err) diag.msgconvert = "ok";
+    res.json(diag);
+  });
 });
 
 app.post('/convert', async (req, res) => {
+  // Auth
   const secret = req.header('X-Ordolux-Secret') || '';
   if (!SHARED_SECRET || secret !== SHARED_SECRET) {
-    return fail(res, 401, 'Unauthorized');
+    return sendError(res, 401, 'Unauthorized');
   }
 
-  const wantsPdf  = (req.headers.accept || '').includes('application/pdf');
-  const wantsJson = (req.headers.accept || '').includes('application/json');
+  const accept = (req.headers.accept || '').toLowerCase();
+  const wantsPdf  = accept.includes('application/pdf');
+  const wantsJson = accept.includes('application/json');
 
   const { fileBase64, filename, fileUrl, options } = req.body || {};
-  if (!fileBase64 && !fileUrl) return fail(res, 400, 'Provide fileBase64 or fileUrl');
-  if (!filename) return fail(res, 400, 'Provide filename');
+  if (!fileBase64 && !fileUrl) return sendError(res, 400, 'Provide fileBase64 or fileUrl');
+  if (!filename) return sendError(res, 400, 'Provide filename');
 
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'ordolux-'));
   const cleanup = async () => { try { await fsp.rm(tmpDir, { recursive: true, force: true }); } catch {} };
 
   const logs = [];
   try {
-    // 1) Acquire bytes
+    // Acquire bytes
     let bytes;
     if (fileBase64) {
       try {
         bytes = Buffer.from(fileBase64, 'base64');
       } catch (e) {
-        return fail(res, 400, 'Invalid base64', String(e && e.message || e));
+        return sendError(res, 400, 'Invalid base64', String(e && e.message || e));
       }
     } else {
-      // (Optional) remote fetch path; disabled by default for safety
-      return fail(res, 400, 'fileUrl not supported in this build, use fileBase64');
+      return sendError(res, 400, 'fileUrl not supported in this build (use fileBase64)');
     }
 
-    const ext = path.extname(filename || '').toLowerCase();
+    const ext = (path.extname(filename || '') || '').toLowerCase();
     const srcPath = path.join(tmpDir, `upload${ext || ''}`);
     await fsp.writeFile(srcPath, bytes);
 
-    // 2) If .msg → convert to .eml via msgconvert
+    // If MSG → use msgconvert to produce an EML
     let emlPath = null;
     if (ext === '.msg') {
-      const outPath = path.join(tmpDir, 'converted.eml');
       logs.push('detected .msg; invoking msgconvert');
+      // Verify msgconvert exists right now (gives clearer errors than a 500)
+      const ok = await new Promise((resolve) => {
+        execFile('msgconvert', ['--help'], { timeout: 4000 }, (err) => resolve(!err));
+      });
+      if (!ok) {
+        return sendError(res, 500,
+          'msgconvert not available in container. Please redeploy with correct Dockerfile (libemail-outlook-message-perl).',
+          { logs });
+      }
+      const outPath = path.join(tmpDir, 'converted.eml');
       await new Promise((resolve, reject) => {
-        execFile('msgconvert', ['--outfile', outPath, srcPath], { timeout: 30000 }, (err, stdout, stderr) => {
+        execFile('msgconvert', ['--outfile', outPath, srcPath], { timeout: 30000 }, (err, _stdout, stderr) => {
           if (err) {
             logs.push(`msgconvert failed: ${stderr || String(err)}`);
-            return reject(new Error('msgconvert failed (is it installed? file may be corrupt/RTF/TNEF)'));
+            return reject(new Error('msgconvert failed (file may be corrupt / TNEF-only / unsupported variant)'));
           }
           resolve();
         });
@@ -110,31 +106,32 @@ app.post('/convert', async (req, res) => {
     } else if (ext === '.eml') {
       emlPath = srcPath;
     } else {
-      // Not an email: make a tiny “stub” PDF with filename and size (keeps pipeline testable)
+      // Not an email: return a stub PDF so the pipeline remains testable
       const pdf = renderStubPDF(filename, bytes.length);
-      if (wantsJson) {
-        return res.json({ ok: true, route: 'stub-non-email', bytes: bytes.length, logs });
-      }
+      if (wantsJson) return res.json({ ok: true, route: 'stub-non-email', bytes: bytes.length, logs });
       res.type('application/pdf').send(pdf);
       return;
     }
 
-    // 3) Parse EML (subject/from/to/cc/date + html/text)
-    const emlBuf = await fsp.readFile(emlPath);
+    // Parse EML
     let parsed;
     try {
+      const emlBuf = await fsp.readFile(emlPath);
       parsed = await simpleParser(emlBuf);
     } catch (e) {
       logs.push('simpleParser error: ' + (e && e.message || e));
-      return fail(res, 422, 'Failed to parse EML after conversion', String(e && e.message || e));
+      return sendError(res, 422, 'Failed to parse EML after conversion', { logs });
     }
 
+    // Extract fields
     const subject = parsed.subject || '(no subject)';
     const from    = parsed.from ? parsed.from.text : '';
     const to      = parsed.to   ? parsed.to.text   : '';
     const cc      = parsed.cc   ? parsed.cc.text   : '';
-    const date    = parsed.date ? new Date(parsed.date).toISOString() : (parsed.headers && parsed.headers.get && parsed.headers.get('date')) || '';
+    const date    = parsed.date ? new Date(parsed.date).toISOString()
+                                : (parsed.headers && parsed.headers.get && parsed.headers.get('date')) || '';
 
+    // Prefer HTML→text; fallback to text
     let bodyText = '';
     if (parsed.html) {
       try {
@@ -151,27 +148,24 @@ app.post('/convert', async (req, res) => {
 
     if (!bodyText || !bodyText.trim()) {
       logs.push('No readable body after parsing');
-      return fail(res, 422, 'No readable body found in message', { logs });
+      return sendError(res, 422, 'No readable body found in message', { logs });
     }
 
-    // 4) Render PDF (simple, robust)
+    // Render PDF
     const pdfBuffer = await renderEmailPDF({
       title: subject,
       meta: { From: from, To: to, Cc: cc, Date: date },
       bodyText
     });
 
-    // (Optional) merge PDF attachments later; for now we return the main PDF.
-    if (wantsJson) {
-      return res.json({ ok: true, route: (ext === '.msg' ? 'msg->eml->pdf' : 'eml->pdf'), logs });
-    }
+    if (wantsJson) return res.json({ ok: true, route: (ext === '.msg' ? 'msg->eml->pdf' : 'eml->pdf'), logs });
 
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Cache-Control', 'no-store');
-    return res.send(pdfBuffer);
+    res.send(pdfBuffer);
 
   } catch (e) {
-    return fail(res, 500, 'Internal error', { msg: String(e && e.message || e), logs });
+    return sendError(res, 500, 'Internal error', { msg: String(e && e.message || e), logs });
   } finally {
     await cleanup();
   }
@@ -198,12 +192,11 @@ function renderEmailPDF({ title, meta, bodyText }) {
     doc.on('data', d => chunks.push(d));
     doc.on('end', () => resolve(Buffer.concat(chunks)));
 
-    doc.fontSize(18).text(title, { width: 515, continued: false });
+    doc.fontSize(18).text(title, { width: 515 });
     doc.moveDown(0.5);
 
     doc.fontSize(11);
-    const keys = ['From', 'To', 'Cc', 'Date'];
-    keys.forEach(k => {
+    ['From', 'To', 'Cc', 'Date'].forEach(k => {
       const v = (meta && meta[k]) ? String(meta[k]).trim() : '';
       if (v) doc.text(`${k}: ${v}`, { width: 515 });
     });
