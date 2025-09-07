@@ -1,30 +1,14 @@
-FROM node:18-bullseye
+FROM node:20-slim
 
-# Tools for conversions
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-      libemail-outlook-message-perl \
-      libemail-mime-perl \
-      libemail-sender-perl \
-      libio-stringy-perl \
-      wkhtmltopdf \
-      libreoffice \
-      imagemagick \
-      poppler-utils \
-      ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
-
+ENV NODE_ENV=production
 WORKDIR /app
 
-# Copy only package.json so we don't enforce a lockfile match
+# Only package.json -> install -> then copy code (faster layer caching)
 COPY package.json ./
-
-# Install production deps
 RUN npm install --omit=dev
 
-# Copy the app code
 COPY server.js ./
 
 ENV PORT=8080
-ENV MAX_BYTES=26214400
-CMD ["node","server.js"]
+EXPOSE 8080
+CMD ["node", "server.js"]
