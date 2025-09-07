@@ -1,8 +1,8 @@
-// OrdoLux Email→PDF microservice (EML + MSG via msgconvert)
+// OrdoLux Email→PDF microservice (EML + MSG via Python extract_msg)
 // Auth: header X-Ordolux-Secret must equal process.env.SHARED_SECRET
 // Endpoints:
 //   GET  /healthz -> { ok: true }
-//   GET  /diag    -> { ok:true, node, secretSet, msgconvert: "ok"|"missing" }
+//   GET  /diag    -> { ok:true, node, secretSet, python:"ok"|"missing" }
 //   POST /convert { fileBase64, filename, options? } -> PDF (Accept: application/pdf) or JSON (Accept: application/json)
 
 const express    = require('express');
@@ -36,9 +36,9 @@ app.get('/healthz', (req, res) => {
 });
 
 app.get('/diag', (req, res) => {
-  const diag = { ok: true, node: process.version, secretSet: !!SHARED_SECRET, msgconvert: "missing" };
-  execFile('msgconvert', ['--version'], { timeout: 4000 }, (err) => {
-    if (!err) diag.msgconvert = "ok";
+  const diag = { ok: true, node: process.version, secretSet: !!SHARED_SECRET, python: "missing" };
+  execFile('python3', ['--version'], { timeout: 4000 }, (err) => {
+    if (!err) diag.python = "ok";
     res.json(diag);
   });
 });
@@ -63,7 +63,7 @@ app.post('/convert', async (req, res) => {
 
   const logs = [];
   try {
-    // Acquire bytes
+    // Acquire bytes (this build only supports base64 to keep things simple)
     let bytes;
     if (fileBase64) {
       try {
@@ -79,25 +79,27 @@ app.post('/convert', async (req, res) => {
     const srcPath = path.join(tmpDir, `upload${ext || ''}`);
     await fsp.writeFile(srcPath, bytes);
 
-    // If MSG → use msgconvert to produce an EML
+    // If MSG → use Python extract_msg to produce an EML
     let emlPath = null;
     if (ext === '.msg') {
-      logs.push('detected .msg; invoking msgconvert');
-      // Verify msgconvert exists right now (gives clearer errors than a 500)
-      const ok = await new Promise((resolve) => {
-        execFile('msgconvert', ['--help'], { timeout: 4000 }, (err) => resolve(!err));
+      logs.push('detected .msg; invoking msg2eml.py (extract_msg)');
+      const outPath = path.join(tmpDir, 'converted.eml');
+
+      // quick python check
+      const pyOk = await new Promise((resolve) => {
+        execFile('python3', ['-c', 'import extract_msg'], { timeout: 5000 }, (err) => resolve(!err));
       });
-      if (!ok) {
+      if (!pyOk) {
         return sendError(res, 500,
-          'msgconvert not available in container. Please redeploy with correct Dockerfile (libemail-outlook-message-perl).',
+          'Python extract_msg not available in container. Please redeploy with correct Dockerfile.',
           { logs });
       }
-      const outPath = path.join(tmpDir, 'converted.eml');
+
       await new Promise((resolve, reject) => {
-        execFile('msgconvert', ['--outfile', outPath, srcPath], { timeout: 30000 }, (err, _stdout, stderr) => {
+        execFile('python3', ['/app/msg2eml.py', srcPath, outPath], { timeout: 45000 }, (err, _stdout, stderr) => {
           if (err) {
-            logs.push(`msgconvert failed: ${stderr || String(err)}`);
-            return reject(new Error('msgconvert failed (file may be corrupt / TNEF-only / unsupported variant)'));
+            logs.push(`msg2eml.py failed: ${stderr || String(err)}`);
+            return reject(new Error('MSG→EML conversion failed (file may be corrupt/unsupported)'));
           }
           resolve();
         });
@@ -158,7 +160,7 @@ app.post('/convert', async (req, res) => {
       bodyText
     });
 
-    if (wantsJson) return res.json({ ok: true, route: (ext === '.msg' ? 'msg->eml->pdf' : 'eml->pdf'), logs });
+    if (wantsJson) return res.json({ ok: true, route: (ext === '.msg' ? 'msg(py)->eml->pdf' : 'eml->pdf'), logs });
 
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Cache-Control', 'no-store');
