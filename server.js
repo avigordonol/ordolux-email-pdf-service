@@ -1,183 +1,222 @@
-// OrdoLux Email→PDF microservice (no msgreader; uses msgconvert for .msg)
-// - Accepts { fileBase64?, fileUrl?, filename?, options?{mergeAttachments} }
-// - Auth: X-Ordolux-Secret must equal process.env.SHARED_SECRET
-// - Returns application/pdf (email cover page; merges PDF attachments if asked)
+// OrdoLux Email→PDF microservice (EML + MSG via msgconvert)
+// - Auth: header X-Ordolux-Secret must equal process.env.SHARED_SECRET
+// - POST /convert: { fileBase64, filename, options? }
+//      -> application/pdf (default) OR application/json (if Accept: application/json)
+// - GET  /healthz: { ok: true }
+// - GET  /diag: environment diagnostics
 
-import express from 'express';
-import { simpleParser } from 'mailparser';
-import { jsPDF } from 'jspdf';
-import { PDFDocument } from 'pdf-lib';
-import he from 'he';
-import fs from 'fs/promises';
-import { execFile } from 'child_process';
-import { promisify } from 'util';
+const express    = require('express');
+const bodyParser = require('body-parser');
+const crypto     = require('crypto');
+const fs         = require('fs');
+const fsp        = fs.promises;
+const os         = require('os');
+const path       = require('path');
+const { execFile } = require('child_process');
+const { simpleParser } = require('mailparser');
+const { htmlToText }  = require('html-to-text');
+const PDFDocument     = require('pdfkit');
 
-const execFileP = promisify(execFile);
-const app = express();
-const SHARED_SECRET = process.env.SHARED_SECRET || '';
 const PORT = process.env.PORT || 8080;
+const SHARED_SECRET = process.env.SHARED_SECRET || '';
 
-app.use(express.json({ limit: '50mb' }));
+const app = express();
+app.use(bodyParser.json({ limit: '50mb' }));
 
-app.get('/healthz', (_req, res) => res.json({ ok: true }));
+function fail(res, code, msg, extra) {
+  const out = { ok: false, error: msg };
+  if (extra) out.details = extra;
+  // If caller wants JSON, always send JSON
+  const wantsJson = (res.req.headers.accept || '').includes('application/json');
+  if (wantsJson) return res.status(code).json(out);
+  // Otherwise text for errors
+  return res.status(code).type('text/plain').send(JSON.stringify(out));
+}
+
+app.get('/healthz', (req, res) => {
+  if (!SHARED_SECRET) return res.status(500).json({ ok: false, error: 'Missing SHARED_SECRET' });
+  return res.json({ ok: true });
+});
+
+app.get('/diag', async (req, res) => {
+  const diag = {
+    ok: true,
+    node: process.version,
+    secretSet: !!SHARED_SECRET,
+    msgconvert: null
+  };
+  try {
+    await new Promise((resolve, reject) => {
+      execFile('msgconvert', ['--help'], { timeout: 4000 }, (err, stdout, stderr) => {
+        if (err) return resolve(); // not fatal, just absent
+        diag.msgconvert = 'ok';
+        resolve();
+      });
+    });
+  } catch {}
+  res.json(diag);
+});
 
 app.post('/convert', async (req, res) => {
+  const secret = req.header('X-Ordolux-Secret') || '';
+  if (!SHARED_SECRET || secret !== SHARED_SECRET) {
+    return fail(res, 401, 'Unauthorized');
+  }
+
+  const wantsPdf  = (req.headers.accept || '').includes('application/pdf');
+  const wantsJson = (req.headers.accept || '').includes('application/json');
+
+  const { fileBase64, filename, fileUrl, options } = req.body || {};
+  if (!fileBase64 && !fileUrl) return fail(res, 400, 'Provide fileBase64 or fileUrl');
+  if (!filename) return fail(res, 400, 'Provide filename');
+
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'ordolux-'));
+  const cleanup = async () => { try { await fsp.rm(tmpDir, { recursive: true, force: true }); } catch {} };
+
+  const logs = [];
   try {
-    // Auth
-    const sent = req.header('X-Ordolux-Secret') || '';
-    if (!SHARED_SECRET || sent !== SHARED_SECRET) {
-      return res.status(401).json({ ok: false, error: 'Invalid signature' });
-    }
-
-    const body = req.body || {};
-    const fileBase64 = body.fileBase64 || null;
-    const fileUrl = body.fileUrl || null;
-    const filename = (body.filename || 'Email.eml').trim();
-    const options = body.options || {};
-
-    if (!fileBase64 && !fileUrl) {
-      return res.status(400).json({ ok: false, error: 'Provide fileBase64 or fileUrl' });
-    }
-
-    // Fetch/Decode bytes
+    // 1) Acquire bytes
     let bytes;
     if (fileBase64) {
-      bytes = Buffer.from(fileBase64, 'base64');
+      try {
+        bytes = Buffer.from(fileBase64, 'base64');
+      } catch (e) {
+        return fail(res, 400, 'Invalid base64', String(e && e.message || e));
+      }
     } else {
-      const r = await fetch(fileUrl);
-      if (!r.ok) return res.status(400).json({ ok: false, error: `download ${r.status}` });
-      bytes = Buffer.from(await r.arrayBuffer());
+      // (Optional) remote fetch path; disabled by default for safety
+      return fail(res, 400, 'fileUrl not supported in this build, use fileBase64');
     }
 
-    // If .msg, convert to .eml via msgconvert; else treat as .eml
-    let emlBuffer;
-    if (/\.msg$/i.test(filename)) {
-      emlBuffer = await msgToEml(bytes);
+    const ext = path.extname(filename || '').toLowerCase();
+    const srcPath = path.join(tmpDir, `upload${ext || ''}`);
+    await fsp.writeFile(srcPath, bytes);
+
+    // 2) If .msg → convert to .eml via msgconvert
+    let emlPath = null;
+    if (ext === '.msg') {
+      const outPath = path.join(tmpDir, 'converted.eml');
+      logs.push('detected .msg; invoking msgconvert');
+      await new Promise((resolve, reject) => {
+        execFile('msgconvert', ['--outfile', outPath, srcPath], { timeout: 30000 }, (err, stdout, stderr) => {
+          if (err) {
+            logs.push(`msgconvert failed: ${stderr || String(err)}`);
+            return reject(new Error('msgconvert failed (is it installed? file may be corrupt/RTF/TNEF)'));
+          }
+          resolve();
+        });
+      });
+      emlPath = outPath;
+    } else if (ext === '.eml') {
+      emlPath = srcPath;
     } else {
-      emlBuffer = bytes;
+      // Not an email: make a tiny “stub” PDF with filename and size (keeps pipeline testable)
+      const pdf = renderStubPDF(filename, bytes.length);
+      if (wantsJson) {
+        return res.json({ ok: true, route: 'stub-non-email', bytes: bytes.length, logs });
+      }
+      res.type('application/pdf').send(pdf);
+      return;
     }
 
-    // Parse email
-    const parsed = await simpleParser(emlBuffer);
-    const title = parsed.subject || '(no subject)';
-    const meta = {
-      From: parsed.from?.text || '',
-      To: parsed.to?.text || '',
-      Cc: parsed.cc?.text || '',
-      Date: parsed.date ? parsed.date.toISOString() : ''
-    };
+    // 3) Parse EML (subject/from/to/cc/date + html/text)
+    const emlBuf = await fsp.readFile(emlPath);
+    let parsed;
+    try {
+      parsed = await simpleParser(emlBuf);
+    } catch (e) {
+      logs.push('simpleParser error: ' + (e && e.message || e));
+      return fail(res, 422, 'Failed to parse EML after conversion', String(e && e.message || e));
+    }
 
-    let bodyText = (parsed.text || '').trim();
-    if (!bodyText && parsed.html) bodyText = htmlToText(parsed.html);
+    const subject = parsed.subject || '(no subject)';
+    const from    = parsed.from ? parsed.from.text : '';
+    const to      = parsed.to   ? parsed.to.text   : '';
+    const cc      = parsed.cc   ? parsed.cc.text   : '';
+    const date    = parsed.date ? new Date(parsed.date).toISOString() : (parsed.headers && parsed.headers.get && parsed.headers.get('date')) || '';
 
-    // Build cover PDF for the email body
-    const coverBytes = renderEmailPDF({
-      title,
-      meta,
-      bodyText: bodyText || '(no body)'
+    let bodyText = '';
+    if (parsed.html) {
+      try {
+        bodyText = htmlToText(parsed.html, {
+          wordwrap: 100,
+          selectors: [
+            { selector: 'a', options: { hideLinkHrefIfSameAsText: true } },
+            { selector: 'img', format: 'skip' }
+          ]
+        });
+      } catch {}
+    }
+    if (!bodyText && parsed.text) bodyText = parsed.text;
+
+    if (!bodyText || !bodyText.trim()) {
+      logs.push('No readable body after parsing');
+      return fail(res, 422, 'No readable body found in message', { logs });
+    }
+
+    // 4) Render PDF (simple, robust)
+    const pdfBuffer = await renderEmailPDF({
+      title: subject,
+      meta: { From: from, To: to, Cc: cc, Date: date },
+      bodyText
     });
 
-    // If asked, merge any PDF attachments after the cover
-    let outBytes = coverBytes;
-    if (options.mergeAttachments && Array.isArray(parsed.attachments) && parsed.attachments.length) {
-      outBytes = await mergePdfAndPdfAttachments(coverBytes, parsed.attachments);
+    // (Optional) merge PDF attachments later; for now we return the main PDF.
+    if (wantsJson) {
+      return res.json({ ok: true, route: (ext === '.msg' ? 'msg->eml->pdf' : 'eml->pdf'), logs });
     }
 
     res.setHeader('Content-Type', 'application/pdf');
-    return res.send(Buffer.from(outBytes));
+    res.setHeader('Cache-Control', 'no-store');
+    return res.send(pdfBuffer);
+
   } catch (e) {
-    console.error(e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-});
-
-app.listen(PORT, () => {
-  console.log('Email→PDF listening on :' + PORT);
-});
-
-// ---- helpers ----
-
-async function msgToEml(msgBytes) {
-  const id = Math.random().toString(36).slice(2);
-  const inPath = `/tmp/${id}.msg`;
-  const outPath = `/tmp/${id}.eml`;
-  await fs.writeFile(inPath, msgBytes);
-  try {
-    // msgconvert comes from libemail-outlook-message-perl
-    await execFileP('msgconvert', ['--outfile', outPath, inPath], { timeout: 30_000 });
-    const eml = await fs.readFile(outPath);
-    return eml;
+    return fail(res, 500, 'Internal error', { msg: String(e && e.message || e), logs });
   } finally {
-    // best-effort cleanup
-    await fs.rm(inPath, { force: true }).catch(() => {});
-    await fs.rm(outPath, { force: true }).catch(() => {});
+    await cleanup();
   }
-}
+});
 
-function htmlToText(html) {
-  let s = String(html || '');
-  s = s.replace(/<head[\s\S]*?<\/head>/gi, '');
-  s = s.replace(/<style[\s\S]*?<\/style>/gi, '');
-  s = s.replace(/<script[\s\S]*?<\/script>/gi, '');
-  s = s.replace(/<br\s*\/?>/gi, '\n');
-  s = s.replace(/<\/p>/gi, '\n');
-  s = s.replace(/<\/li>/gi, '\n• ');
-  s = s.replace(/<[^>]+>/g, '');
-  s = he.decode(s);
-  s = s.replace(/\r/g, '').replace(/\n{3,}/g, '\n\n').trim();
-  return s;
+function renderStubPDF(filename, size) {
+  const doc = new PDFDocument({ size: 'A4', margin: 40 });
+  const chunks = [];
+  doc.on('data', d => chunks.push(d));
+  doc.on('end', () => {});
+  doc.fontSize(22).text('OrdoLux Email→PDF (Stub)', { underline: true });
+  doc.moveDown();
+  doc.fontSize(12).text(`Filename: ${filename}`);
+  doc.text(`Bytes: ${size}`);
+  doc.text(`Generated: ${new Date().toISOString()}`);
+  doc.end();
+  return Buffer.concat(chunks);
 }
 
 function renderEmailPDF({ title, meta, bodyText }) {
-  const doc = new jsPDF({ unit: 'pt', format: 'a4', compress: true });
-  const m = 40, width = 595.28 - m * 2;
-  let y = m;
+  return new Promise((resolve) => {
+    const doc = new PDFDocument({ size: 'A4', margin: 40 });
+    const chunks = [];
+    doc.on('data', d => chunks.push(d));
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
 
-  doc.setFont('helvetica', 'bold'); doc.setFontSize(18);
-  y = addWrapped(doc, title, m, y, width, 20);
+    doc.fontSize(18).text(title, { width: 515, continued: false });
+    doc.moveDown(0.5);
 
-  doc.setFont('helvetica', 'normal'); doc.setFontSize(11);
-  for (const key of ['From', 'To', 'Cc', 'Date']) {
-    const v = meta[key];
-    if (v && String(v).trim()) y = addWrapped(doc, key + ': ' + v, m, y, width, 16);
-  }
-  doc.setLineWidth(0.5); doc.line(m, y + 5, m + width, y + 5); y += 20;
+    doc.fontSize(11);
+    const keys = ['From', 'To', 'Cc', 'Date'];
+    keys.forEach(k => {
+      const v = (meta && meta[k]) ? String(meta[k]).trim() : '';
+      if (v) doc.text(`${k}: ${v}`, { width: 515 });
+    });
 
-  doc.setFontSize(12);
-  y = addWrapped(doc, String(bodyText || '').slice(0, 800000), m, y, width, 16);
-  return doc.output('arraybuffer');
+    doc.moveDown(0.5);
+    doc.moveTo(40, doc.y).lineTo(555, doc.y).stroke();
+    doc.moveDown();
+
+    doc.fontSize(12).text(String(bodyText || '').slice(0, 500000), { width: 515 });
+    doc.end();
+  });
 }
 
-function addWrapped(doc, text, x, y, maxWidth, lineHeight) {
-  const parts = doc.splitTextToSize(text || '', maxWidth);
-  for (let i = 0; i < parts.length; i++) {
-    if (y > 800) { doc.addPage(); y = 40; }
-    doc.text(parts[i], x, y);
-    y += lineHeight;
-  }
-  return y;
-}
-
-async function mergePdfAndPdfAttachments(coverArrayBuffer, attachments) {
-  const out = await PDFDocument.create();
-
-  // add the cover first
-  const coverDoc = await PDFDocument.load(coverArrayBuffer);
-  const coverPages = await out.copyPages(coverDoc, coverDoc.getPageIndices());
-  coverPages.forEach(p => out.addPage(p));
-
-  // append any PDF attachments
-  for (const a of attachments) {
-    const ct = String(a.contentType || '').toLowerCase().trim();
-    if (ct === 'application/pdf' && a.content && a.content.length) {
-      try {
-        const attDoc = await PDFDocument.load(a.content);
-        const pages = await out.copyPages(attDoc, attDoc.getPageIndices());
-        pages.forEach(p => out.addPage(p));
-      } catch (_e) {
-        // ignore broken PDFs
-      }
-    }
-  }
-  return out.save();
-}
+app.listen(PORT, () => {
+  console.log(`OrdoLux email-pdf service listening on :${PORT}`);
+});
