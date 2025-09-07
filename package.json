@@ -1,16 +1,17 @@
 {
   "name": "ordolux-email-pdf-service",
-  "version": "1.0.0",
-  "type": "module",
-  "engines": { "node": ">=18.18.0" },
+  "version": "0.2.0",
+  "description": "Convert EML/MSG to PDF for OrdoLux",
+  "main": "server.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
+    "body-parser": "1.20.2",
     "express": "4.19.2",
-    "he": "1.2.0",
-    "jspdf": "2.5.1",
-    "mailparser": "3.6.7",
-    "pdf-lib": "1.17.1"
+    "html-to-text": "9.0.5",
+    "mailparser": "3.9.0",
+    "pdfkit": "0.13.0"
   }
 }
