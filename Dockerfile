@@ -1,5 +1,4 @@
-# OrdoLux Email→PDF microservice (MSG via msgconvert -> EML -> PDF)
-# This image installs msgconvert and all required Perl deps from Debian repos.
+# OrdoLux Email→PDF microservice (MSG via Python extract_msg -> EML -> PDF)
 
 FROM node:20-slim
 
@@ -7,35 +6,27 @@ ENV NODE_ENV=production
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=C.UTF-8
 
-# Update + install msgconvert and its common deps
-# (We include extras that some distros don’t auto-pull to avoid runtime surprises.)
+# System deps: Python + pip for extract_msg; certificates for TLS
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    perl \
-    libemail-outlook-message-perl \
-    libemail-mime-perl \
-    libemail-mime-contenttype-perl \
-    libemail-sender-perl \
-    libio-stringy-perl \
-    libole-storage-lite-perl \
-    libdatetime-format-mail-perl \
-    libstring-crc32-perl \
-    libmime-tools-perl \
-    libfile-libmagic-perl \
-    libconvert-tnef-perl \
-    ca-certificates \
+    python3 python3-pip ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-# Sanity: ensure msgconvert is callable now (fail early if missing)
-RUN msgconvert --help >/dev/null 2>&1 || (echo "msgconvert not available" && exit 1)
+# Python libs for MSG reading (pin for reproducibility)
+RUN pip3 install --no-cache-dir \
+    extract_msg==0.47.6 \
+    olefile==0.47 \
+    compressed-rtf==1.0.6 \
+    chardet==5.2.0
 
 WORKDIR /app
 
-# Install Node deps (no lockfile to avoid lock mismatch errors)
+# Install Node deps (no lockfile to avoid lock mismatch during first deploy)
 COPY package.json ./
 RUN npm install --omit=dev
 
 # App code
 COPY server.js ./
+COPY msg2eml.py ./
 
 EXPOSE 8080
 CMD ["node", "server.js"]
