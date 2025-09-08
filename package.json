@@ -3,13 +3,10 @@
   "version": "1.0.0",
   "private": true,
   "main": "server.cjs",
-  "scripts": {
-    "start": "node server.cjs"
-  },
+  "scripts": { "start": "node server.cjs" },
   "dependencies": {
     "express": "4.19.2",
     "mailparser": "3.6.7",
-    "pdf-lib": "1.17.1",
-    "tmp": "0.2.3"
+    "pdf-lib": "1.17.1"
   }
 }
