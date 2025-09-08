@@ -1,33 +1,37 @@
-# Lightweight Node + Python env
+# ---- OrdoLux Email→PDF service (Node + Python) ----
 FROM node:20-slim
 
-# System deps (fonts help PDF rendering)
+# OS packages: Python (for .msg parsing), fonts for PDF text, certs
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3 python3-venv python3-pip \
-      fonts-dejavu-core ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    python3 python3-venv python3-pip \
+    fonts-dejavu-core \
+    ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
 
-# Dedicated Python venv (avoids PEP 668 issues)
+# Create isolated Python env (avoids PEP 668 issues)
 RUN python3 -m venv /opt/pyenv
 ENV PATH="/opt/pyenv/bin:${PATH}"
 
-# Python libs for .msg parsing
+# Python deps used by msg_to_json.py (pin versions for reproducibility)
 RUN pip install --no-cache-dir \
-      extract_msg==0.55.0 \
-      olefile==0.47 \
-      compressed-rtf==1.0.6 \
-      chardet==5.2.0 \
-      tzlocal==5.2 \
-      ebcdic==1.1.1
+    extract_msg==0.55.0 \
+    olefile==0.47 \
+    compressed-rtf==1.0.6 \
+    chardet==5.2.0 \
+    tzlocal==5.2 \
+    ebcdic==1.1.1
 
+# App directory
 WORKDIR /app
 
-# Install Node deps
+# Install Node deps first for better layer caching
 COPY package.json ./
+ENV NODE_ENV=production
 RUN npm install --omit=dev
 
 # App code
 COPY server.cjs msg_to_json.py ./
 
+# Runtime config
 EXPOSE 8080
 CMD ["node", "server.cjs"]
