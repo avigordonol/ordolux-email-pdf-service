@@ -14,8 +14,6 @@ const SHARED_SECRET = process.env.SHARED_SECRET || ''; // set in Railway if you 
 const PYTHON = '/opt/pyenv/bin/python3';               // python inside venv
 
 const app = express();
-
-// raw body not required any more; JSON is enough
 app.use(express.json({ limit: '50mb' }));
 
 function guard(req, res, next) {
@@ -27,7 +25,7 @@ function guard(req, res, next) {
 
 app.get('/healthz', guard, (_req, res) => res.status(200).send('ok'));
 
-// ---- Helpers ---------------------------------------------------------------
+// ---------- helpers ----------
 
 function safeName(name = '') {
   return String(name).replace(/[^\w.\-]+/g, '_');
@@ -92,19 +90,17 @@ async function parseMsg(buffer) {
 }
 
 function renderHtmlWithCidImages(doc, html, cidMap) {
-  // 1) Write text without dumping insanely long SafeLinks
+  // Render text without dumping insanely long hrefs (SafeLinks)
   const opts = {
     wordwrap: 120,
     preserveNewlines: true,
     selectors: [
-      // render link text only (ignore href)
       { selector: 'a', options: { ignoreHref: true, noLinkBrackets: true } },
-      // we’ll place images ourselves
-      { selector: 'img', format: 'skip' }
+      { selector: 'img', format: 'skip' } // images inserted separately
     ]
   };
 
-  // split HTML on <img src="cid:..."> and draw images in between text chunks
+  // Insert inline CID images in place
   const re = /<img[^>]+src=["']cid:([^"']+)["'][^>]*>/gi;
   let idx = 0;
   let m;
@@ -119,9 +115,7 @@ function renderHtmlWithCidImages(doc, html, cidMap) {
       try {
         const maxW = doc.page.width - doc.page.margins.left - doc.page.margins.right;
         doc.image(buf, { fit: [maxW, 260] }).moveDown(0.5);
-      } catch (e) {
-        // ignore bad image types
-      }
+      } catch (_) {}
     }
     idx = re.lastIndex;
   }
@@ -136,71 +130,62 @@ async function buildPdf(parsed, { includeBrand = false } = {}) {
   doc.on('data', d => chunks.push(d));
   const done = new Promise(r => doc.on('end', r));
 
-  // Robust Unicode fonts (installed via apt)
+  // Unicode fonts
   const REG = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
   const BOLD = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
-  const haveReg = fs.existsSync(REG);
-  const haveBold = fs.existsSync(BOLD);
-  if (haveReg) doc.font(REG);
+  if (fs.existsSync(REG)) doc.font(REG);
 
-  // Optional tiny brand (disabled by default, as requested)
+  // Branding removed by default (set includeBrand=true to show)
   if (includeBrand) {
-    doc.font(haveBold ? BOLD : REG).fontSize(9).fillColor('#666').text('OrdoLux Email → PDF', {
-      align: 'right'
-    });
-    doc.moveDown(0.2).fillColor('black');
+    doc.font(fs.existsSync(BOLD) ? BOLD : REG).fontSize(9).fillColor('#666')
+      .text('OrdoLux Email → PDF', { align: 'right' })
+      .moveDown(0.2)
+      .fillColor('black');
   }
 
-  // Title (Subject)
+  // Subject
   if (parsed.subject) {
-    doc.font(haveBold ? BOLD : REG).fontSize(16).text(parsed.subject);
+    doc.font(fs.existsSync(BOLD) ? BOLD : REG).fontSize(16).text(parsed.subject);
     doc.moveDown(0.3);
   }
 
-  // Header fields
-  doc
-    .fontSize(9)
-    .font(haveBold ? BOLD : REG)
-    .text('From: ', { continued: true })
-    .font(REG)
-    .text(formatAddrs(parsed.from));
+  // Headers
+  doc.fontSize(9);
+  doc.font(fs.existsSync(BOLD) ? BOLD : REG).text('From: ', { continued: true })
+     .font(REG).text(formatAddrs(parsed.from));
   if (parsed.to?.length) {
-    doc.font(haveBold ? BOLD : REG).text('To: ', { continued: true }).font(REG).text(formatAddrs(parsed.to));
+    doc.font(fs.existsSync(BOLD) ? BOLD : REG).text('To: ', { continued: true })
+       .font(REG).text(formatAddrs(parsed.to));
   }
   if (parsed.cc?.length) {
-    doc.font(haveBold ? BOLD : REG).text('Cc: ', { continued: true }).font(REG).text(formatAddrs(parsed.cc));
+    doc.font(fs.existsSync(BOLD) ? BOLD : REG).text('Cc: ', { continued: true })
+       .font(REG).text(formatAddrs(parsed.cc));
   }
   if (parsed.date) {
     const d = new Date(parsed.date);
-    doc.font(haveBold ? BOLD : REG).text('Date: ', { continued: true }).font(REG).text(d.toString());
+    doc.font(fs.existsSync(BOLD) ? BOLD : REG).text('Date: ', { continued: true })
+       .font(REG).text(d.toString());
   }
 
   // Divider
   const x1 = doc.page.margins.left;
   const x2 = doc.page.width - doc.page.margins.right;
-  doc
-    .moveDown(0.5)
-    .lineWidth(0.5)
-    .strokeColor('#888')
-    .moveTo(x1, doc.y)
-    .lineTo(x2, doc.y)
-    .stroke()
-    .moveDown(0.6);
+  doc.moveDown(0.5).lineWidth(0.5).strokeColor('#888')
+     .moveTo(x1, doc.y).lineTo(x2, doc.y).stroke().moveDown(0.6);
 
-  // Build CID map for inline images
+  // Inline images map
   const cidMap = new Map();
   (parsed.attachments || []).forEach(a => {
     if (a.inline && a.contentId) cidMap.set(a.contentId.replace(/[<>]/g, ''), a.data);
   });
 
-  // Prefer HTML body (fixes RTF/encoding gibberish)
+  // Body: prefer HTML for proper punctuation/encoding + images
   if (parsed.html && parsed.html.trim()) {
     renderHtmlWithCidImages(doc, parsed.html, cidMap);
   } else if (parsed.text && parsed.text.trim()) {
     doc.font(REG).fontSize(11).text(parsed.text);
   } else {
-    doc.font(REG).fontSize(11).fillColor('#666').text('(no message body)');
-    doc.fillColor('black');
+    doc.font(REG).fontSize(11).fillColor('#666').text('(no message body)').fillColor('black');
   }
 
   doc.end();
@@ -208,7 +193,7 @@ async function buildPdf(parsed, { includeBrand = false } = {}) {
   return Buffer.concat(chunks);
 }
 
-// ---- Route -----------------------------------------------------------------
+// ---------- route ----------
 
 app.post('/convert', guard, async (req, res) => {
   try {
@@ -227,21 +212,14 @@ app.post('/convert', guard, async (req, res) => {
     const pdf = await buildPdf(parsed, { includeBrand: false });
 
     const wantsJson = (req.get('Accept') || '').includes('application/json');
-    if (wantsJson) {
-      return res.json({
-        ok: true,
-        filename,
-        bytes: pdf.length
-      });
-    }
+    if (wantsJson) return res.json({ ok: true, filename, bytes: pdf.length });
 
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `inline; filename="${safeName(filename)}.pdf"`);
     res.end(pdf);
   } catch (err) {
     console.error(err);
-    const msg = err && err.message ? err.message : String(err);
-    res.status(500).json({ error: msg });
+    res.status(500).json({ error: err?.message || String(err) });
   }
 });
 
