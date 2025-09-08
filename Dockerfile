@@ -1,29 +1,35 @@
-FROM node:20-slim
+# Use slim Node image
+FROM docker.io/library/node:20-slim
 
-# Python for .MSG parsing (extract_msg)
+# Python (for .msg parsing), fonts for full Unicode, and certs
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-venv ca-certificates \
-  && rm -rf /var/lib/apt/lists/*
+      python3 python3-venv python3-pip \
+      fonts-dejavu-core \
+      ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-# Create a venv and install Python libs there
+# Isolated Python env (avoids PEP 668 issues)
 RUN python3 -m venv /opt/pyenv
-RUN /opt/pyenv/bin/pip install --no-cache-dir \
-    extract_msg==0.55.0 \
-    olefile==0.47 \
-    compressed-rtf==1.0.6 \
-    chardet==5.2.0 \
-    tzlocal==5.2 \
-    ebcdic==1.1.1
+ENV PATH="/opt/pyenv/bin:${PATH}"
+
+# Python libs for robust .msg handling (versions known-good)
+RUN pip install --no-cache-dir \
+      extract_msg==0.55.0 \
+      olefile==0.47 \
+      compressed-rtf==1.0.6 \
+      chardet==5.2.0 \
+      tzlocal==5.2 \
+      ebcdic==1.1.1
 
 WORKDIR /app
 
-# Install node deps (prod only)
+# Install Node deps first for better layer caching
 COPY package.json ./
 RUN npm install --omit=dev
 
 # App code
-COPY server.js msg_to_json.py ./
+COPY server.cjs msg_to_json.py ./
 
-ENV PORT=3000
-EXPOSE 3000
-CMD ["node","server.js"]
+EXPOSE 8080
+ENV NODE_ENV=production
+CMD ["node","server.cjs"]
