@@ -1,87 +1,103 @@
 #!/usr/bin/env python3
-# Convert a .msg file into structured JSON for Node.
-# Uses extract_msg and prefers HTML body. Captures inline CID images.
+# -*- coding: utf-8 -*-
 
-import sys, json, base64, mimetypes
-import extract_msg  # installed in the image
-
-if len(sys.argv) != 2:
-    print(json.dumps({"error": "usage: msg_to_json.py <file.msg>"}))
+import sys, os, json, base64
+from datetime import datetime, date
+try:
+    import extract_msg
+except Exception as e:
+    print(json.dumps({"ok": False, "error": f"extract_msg import failed: {e}"}))
     sys.exit(1)
 
-fn = sys.argv[1]
-msg = extract_msg.Message(fn)
-
-def recipients_by(kind_upper):
-    out = []
-    try:
-        for r in getattr(msg, "recipients", []):
-            typ = (getattr(r, "type", "") or "").strip().upper()
-            if typ == kind_upper:
-                name = getattr(r, "name", "") or getattr(r, "display_name", "") or ""
-                addr = (
-                    getattr(r, "email", "")
-                    or getattr(r, "email_address", "")
-                    or getattr(r, "smtp_address", "")
-                    or getattr(r, "address", "")
-                    or ""
-                )
-                out.append({"name": name, "address": addr})
-    except Exception:
-        pass
-    return out
-
-# Sender
-from_list = []
-try:
-    from_list = [{
-        "name": getattr(msg, "sender", "") or "",
-        "address": getattr(msg, "sender_email", "") or getattr(msg, "sender_email_address", "") or ""
-    }]
-except Exception:
-    pass
-
-# Body
-try:
-    html = getattr(msg, "htmlBody", "") or ""
-except Exception:
-    html = ""
-try:
-    text = getattr(msg, "body", "") or ""
-except Exception:
-    text = ""
-
-# Attachments
-atts = []
-for a in getattr(msg, "attachments", []):
-    try:
-        data = a.data
-    except Exception:
+def _to_jsonable(x):
+    """Convert values so json.dumps won't choke (datetime, bytes, etc.)."""
+    if isinstance(x, (datetime, date)):
         try:
-            data = a._data
+            return x.isoformat()
         except Exception:
-            data = b""
-    cid = getattr(a, "contentId", None) or getattr(a, "cid", None) or ""
-    fname = getattr(a, "longFilename", None) or getattr(a, "shortFilename", None) or "attachment"
-    ctype = getattr(a, "mimeType", None) or mimetypes.guess_type(fname)[0] or "application/octet-stream"
-    inline = bool(cid)
-    atts.append({
-        "filename": fname,
-        "contentType": ctype,
-        "contentId": str(cid) if cid else "",
-        "inline": inline,
-        "data": base64.b64encode(data).decode("ascii")
-    })
+            return str(x)
+    if isinstance(x, bytes):
+        try:
+            return x.decode("utf-8", "replace")
+        except Exception:
+            return base64.b64encode(x).decode("ascii")
+    return x
 
-out = {
-    "subject": getattr(msg, "subject", "") or "",
-    "date": getattr(msg, "date", "") or "",
-    "from": from_list,
-    "to": recipients_by("TO"),
-    "cc": recipients_by("CC"),
-    "html": html,
-    "text": text,
-    "attachments": atts
-}
+def _normalize(obj):
+    if isinstance(obj, dict):
+        return {str(k): _normalize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_normalize(v) for v in obj]
+    return _to_jsonable(obj)
 
-print(json.dumps(out))
+def main():
+    if len(sys.argv) < 2:
+        print(json.dumps({"ok": False, "error": "usage: msg_to_json.py <file.msg>"}))
+        return 1
+
+    path = sys.argv[1]
+    if not os.path.exists(path):
+        print(json.dumps({"ok": False, "error": f"file not found: {path}"}))
+        return 1
+
+    try:
+        msg = extract_msg.Message(path)
+        msg_message_id = getattr(msg, "message_id", None)
+        # Bodies
+        text_body = getattr(msg, "body", None) or ""
+        html_body = getattr(msg, "htmlBody", None) or ""
+
+        # Headers
+        headers = {
+            "from":   getattr(msg, "sender", None) or getattr(msg, "sender_email", None) or "",
+            "to":     getattr(msg, "to", None) or "",
+            "cc":     getattr(msg, "cc", None) or "",
+            "bcc":    getattr(msg, "bcc", None) or "",
+            "subject":getattr(msg, "subject", None) or "",
+            "date":   getattr(msg, "date", None),          # may be datetime; _normalize() will fix
+            "message_id": msg_message_id,
+        }
+
+        # Attachments (include minimal safe info + base64 data for merge)
+        atts = []
+        for a in getattr(msg, "attachments", []):
+            try:
+                fname = getattr(a, "longFilename", None) or getattr(a, "shortFilename", None) or "attachment"
+            except Exception:
+                fname = "attachment"
+            try:
+                data = getattr(a, "data", None)
+            except Exception:
+                data = None
+            size = len(data) if isinstance(data, (bytes, bytearray)) else 0
+            content_id = getattr(a, "cid", None) or getattr(a, "contentId", None)
+            mimetype = getattr(a, "mimetype", None)  # may be None; server can guess
+            # base64 the data so Node can merge PDFs if desired
+            b64 = base64.b64encode(data).decode("ascii") if data else None
+
+            atts.append({
+                "filename": fname,
+                "contentId": content_id,
+                "contentType": mimetype,
+                "size": size,
+                "isInline": bool(content_id),
+                "data_b64": b64,
+            })
+
+        out = _normalize({
+            "ok": True,
+            "headers": headers,
+            "text": text_body,
+            "html": html_body,
+            "attachments": atts,
+        })
+
+        print(json.dumps(out, ensure_ascii=False))
+        return 0
+
+    except Exception as e:
+        print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}))
+        return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
