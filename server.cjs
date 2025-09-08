@@ -11,7 +11,7 @@ const fsp = require('fs/promises');
 const os = require('os');
 const path = require('path');
 const { execFile } = require('child_process');
-const PDFDocument = require('pdfkit');
+const PDFDocument = require('pdfkit');           // <- PDFKIT (not pdf-lib)
 const he = require('he');
 const { simpleParser } = require('mailparser');
 
@@ -82,7 +82,7 @@ function splitHtmlToTokens(html) {
 
 async function parseMSG(tmpPath) {
   const out = await new Promise((resolve, reject) => {
-    execFile(PY, [PY_SCRIPT, tmpPath], { timeout: 30000 }, (err, stdout, stderr) => {
+    execFile(PY, [PY_SCRIPT, tmpPath], { timeout: 30000 }, (err, stdout) => {
       if (err) return reject(err);
       try { resolve(JSON.parse(stdout.toString('utf8'))); }
       catch (e) { reject(e); }
@@ -149,7 +149,7 @@ async function parseUploadedEmail(filename, fileB64) {
     return await parseEML(bin);
   }
 
-  // For .msg (or unknown), write a temp file and hand to Python
+  // .msg (or unknown) → Python helper
   const tmp = path.join(os.tmpdir(), `upl-${Date.now()}-${Math.random().toString(36).slice(2)}.msg`);
   await fsp.writeFile(tmp, bin);
   try {
@@ -261,7 +261,7 @@ async function renderPdfFromParsed(parsed, mergeAttachments) {
 app.post('/convert-json', async (req, res) => {
   if (!requireSecret(req, res)) return;
   try {
-    const { fileBase64, filename, options } = req.body || {};
+    const { fileBase64, filename } = req.body || {};
     if (!fileBase64 || !filename) {
       return res.status(422).json({ ok: false, error: 'missing fileBase64 or filename' });
     }
@@ -283,7 +283,7 @@ app.post('/convert-json', async (req, res) => {
           subject: parsed.subject,
           date: parsed.date,
           text_length: textLen,
-          html_length: htmlLen,
+        html_length: htmlLen,
           attach_count: attCount
         },
         cids
@@ -302,7 +302,7 @@ app.post('/convert', async (req, res) => {
     const { fileBase64, filename, options } = req.body || {};
     if (!fileBase64 || !filename) {
       const obj = { ok: false, error: 'missing fileBase64 or filename' };
-      return wantsJson ? res.status(422).json(obj) : res.status(422).json(obj);
+      return res.status(422).json(obj);
     }
     const mergeAttachments = !!(options && options.mergeAttachments);
     const parsed = await parseUploadedEmail(filename, fileBase64);
@@ -312,9 +312,8 @@ app.post('/convert', async (req, res) => {
     res.set('Content-Disposition', `attachment; filename="${path.basename(filename, path.extname(filename))}.pdf"`);
     res.send(pdf);
   } catch (e) {
-    const err = String(e);
-    const obj = { ok: false, error: err, hint: 'Try /convert-json to inspect summary; Unicode-safe font is enabled.' };
-    return wantsJson ? res.status(500).json(obj) : res.status(500).json(obj);
+    const obj = { ok: false, error: String(e), hint: 'Try /convert-json to inspect summary; Unicode-safe font is enabled.' };
+    return res.status(500).json(obj);
   }
 });
 
