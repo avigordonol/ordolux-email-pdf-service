@@ -214,4 +214,35 @@ app.post('/convert', guard, async (req, res) => {
   try {
     const { fileBase64, filename, options = {} } = req.body || {};
     if (!fileBase64 || !filename) {
-      return res.status(422).json({ error: 'fileBase
+      return res.status(422).json({ error: 'fileBase64 and filename are required' });
+    }
+    const buf = Buffer.from(fileBase64, 'base64');
+    const lower = String(filename).toLowerCase();
+
+    let parsed;
+    if (lower.endsWith('.eml')) parsed = await parseEml(buf);
+    else if (lower.endsWith('.msg')) parsed = await parseMsg(buf);
+    else return res.status(415).json({ error: 'Only .eml or .msg files are supported' });
+
+    const pdf = await buildPdf(parsed, { includeBrand: false });
+
+    const wantsJson = (req.get('Accept') || '').includes('application/json');
+    if (wantsJson) {
+      return res.json({
+        ok: true,
+        filename,
+        bytes: pdf.length
+      });
+    }
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${safeName(filename)}.pdf"`);
+    res.end(pdf);
+  } catch (err) {
+    console.error(err);
+    const msg = err && err.message ? err.message : String(err);
+    res.status(500).json({ error: msg });
+  }
+});
+
+app.listen(PORT, () => console.log(`OrdoLux email→pdf listening on :${PORT}`));
