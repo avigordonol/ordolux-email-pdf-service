@@ -1,7 +1,7 @@
 # Use slim Node image
 FROM docker.io/library/node:20-slim
 
-# Python (for .msg parsing), fonts for full Unicode, and certs
+# Python (for .msg parsing), Unicode fonts, certs
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-venv python3-pip \
       fonts-dejavu-core \
@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN python3 -m venv /opt/pyenv
 ENV PATH="/opt/pyenv/bin:${PATH}"
 
-# Python libs for robust .msg handling (versions known-good)
+# Python libs for robust .msg handling
 RUN pip install --no-cache-dir \
       extract_msg==0.55.0 \
       olefile==0.47 \
@@ -27,9 +27,9 @@ WORKDIR /app
 COPY package.json ./
 RUN npm install --omit=dev
 
-# App code
-COPY server.cjs msg_to_json.py ./
+# App code (NOTE: server.js, not server.cjs)
+COPY server.js msg_to_json.py ./
 
 EXPOSE 8080
 ENV NODE_ENV=production
-CMD ["node","server.cjs"]
+CMD ["node","server.js"]
