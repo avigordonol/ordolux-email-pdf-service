@@ -2,7 +2,7 @@
 'use strict';
 
 const express = require('express');
-const PDFDocument = require('pdfkit');
+const PDFDocument = require('pdfkit');   // ✅ pdfkit
 const { simpleParser } = require('mailparser');
 const os = require('os');
 const fs = require('fs');
