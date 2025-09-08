@@ -1,130 +1,140 @@
-# OrdoLux: parse .msg and .eml -> compact JSON (no datetime objects)
-import sys, os, json, base64, mimetypes
-from email import policy
-from email.parser import BytesParser
+#!/usr/bin/env python3
+# Reads a .msg and emits JSON with:
+# - headers (subject/from/to/cc/date)
+# - html_marked (IMG tags -> [[IMG:<cid>]] tokens)
+# - inline (list of inline images with cid/filename/mime/dataBase64)
+# - attachments (non-inline)
+import sys, json, base64, re, mimetypes
+from datetime import datetime
 
-def b64(b): 
-    return base64.b64encode(b or b'').decode('ascii')
+def b64(data: bytes) -> str:
+    return base64.b64encode(data).decode('ascii')
 
-def parse_eml(p):
-    with open(p, 'rb') as f:
-        m = BytesParser(policy=policy.default).parse(f)
-
-    def hdr(name):
-        v = m.get(name)
-        return str(v) if v is not None else ''
-
-    text = ''
-    html = ''
-    atts = []
-
-    for part in m.walk():
-        ctype = part.get_content_type()
-        disp = part.get_content_disposition()
-        if ctype == 'text/plain' and not text:
-            try:
-                text = part.get_content()
-            except Exception:
-                try:
-                    text = (part.get_payload(decode=True) or b'').decode(part.get_content_charset() or 'utf-8','replace')
-                except Exception:
-                    text = ''
-        elif ctype == 'text/html' and not html:
-            try:
-                html = part.get_content()
-            except Exception:
-                try:
-                    html = (part.get_payload(decode=True) or b'').decode(part.get_content_charset() or 'utf-8','replace')
-                except Exception:
-                    html = ''
-        elif disp in ('attachment','inline') or part.get_filename() or part.get('Content-ID'):
-            data = part.get_payload(decode=True) or b''
-            fname = part.get_filename() or ''
-            cid = part.get('Content-ID') or ''
-            atts.append({
-                "filename": fname,
-                "contentType": ctype,
-                "isInline": (disp == 'inline' or bool(cid)),
-                "cid": cid.strip('<>') if isinstance(cid, str) else '',
-                "_content": b64(data)
-            })
-
-    return {
-        "meta": { "source": "eml", "has_html": bool(html), "attachment_count": len(atts) },
-        "message": {
-            "from": hdr('From'), "to": hdr('To'), "cc": hdr('Cc') or '',
-            "subject": hdr('Subject'), "date": hdr('Date') or '',
-            "text": text, "html": html, "attachments": atts
-        }
-    }
-
-def parse_msg(p):
-    import extract_msg
-    m = extract_msg.Message(p)
-
-    # Basic fields
-    from_ = getattr(m, 'sender', '') or ''
-    to = getattr(m, 'to', '') or ''
-    cc = getattr(m, 'cc', '') or ''
-    subject = getattr(m, 'subject', '') or ''
-    date = str(getattr(m, 'date', '') or '')
-
-    text = getattr(m, 'body', '') or ''
-    html = getattr(m, 'htmlBody', '') or ''
-
-    atts = []
-    for a in getattr(m, 'attachments', []):
-        # filenames
-        fname = getattr(a, 'longFilename', None) or getattr(a, 'shortFilename', None) \
-                or getattr(a, 'filename', None) or ''
-        data = getattr(a, 'data', b'') or b''
-
-        ctype = None
-        if fname:
-            ctype = mimetypes.guess_type(fname)[0]
-        if not ctype:
-            if data.startswith(b'\x89PNG\r\n\x1a\n'):
-                ctype = 'image/png'
-            elif data[:2] == b'\xff\xd8':
-                ctype = 'image/jpeg'
-            else:
-                ctype = 'application/octet-stream'
-
-        cid = getattr(a, 'cid', '') or ''
-        is_inline = False
+def iso(dt):
+    if isinstance(dt, datetime):
         try:
-            is_inline = bool(getattr(a, 'isInline', False))
+            return dt.isoformat()
         except Exception:
-            pass
+            return str(dt)
+    return dt
 
-        atts.append({
-            "filename": fname,
-            "contentType": ctype,
-            "isInline": (is_inline or (bool(cid))),
-            "cid": cid.strip('<>') if isinstance(cid, str) else '',
-            "_content": b64(data)
-        })
+def norm_cid(s: str) -> str:
+    if not s: return ""
+    s = s.strip().strip("<>").strip().lower()
+    if s.startswith("cid:"): s = s[4:]
+    # strip any fragment or query
+    s = re.split(r"[?#]", s, 1)[0]
+    return s
 
-    return {
-        "meta": { "source": "msg", "has_html": bool(html), "attachment_count": len(atts) },
-        "message": {
-            "from": from_, "to": to, "cc": cc,
-            "subject": subject, "date": date,
-            "text": text, "html": html, "attachments": atts
+def html_replace_imgs(html: str, used_cids: list) -> str:
+    if not html:
+        return ""
+    # Replace <img src="cid:..."> with [[IMG:cid]]
+    def repl(m):
+        cid = norm_cid(m.group(1))
+        used_cids.append(cid)
+        return f"[[IMG:{cid}]]"
+    pattern = re.compile(r'<img\b[^>]*src=[\'"]cid:([^\'">]+)[\'"][^>]*>', re.IGNORECASE)
+    html2 = pattern.sub(repl, html)
+    return html2
+
+def load_msg(path: str):
+    import extract_msg
+    from compressed_rtf import rtf_to_text
+
+    msg = extract_msg.Message(path)
+    msg_message_date = getattr(msg, "date", None) or getattr(msg, "sentOn", None)
+
+    subject = getattr(msg, "subject", "") or ""
+    from_   = getattr(msg, "sender", "") or ""
+    to      = getattr(msg, "to", "") or ""
+    cc      = getattr(msg, "cc", "") or ""
+
+    html = getattr(msg, "htmlBody", None)
+    if not html:
+        # fall back to RTF -> text -> very simple HTML
+        rtf = getattr(msg, "rtfBody", None)
+        if rtf:
+            try:
+                text = rtf_to_text(rtf)
+            except Exception:
+                text = getattr(msg, "body", "") or ""
+        else:
+            text = getattr(msg, "body", "") or ""
+        html = "<div>" + (text or "").replace("\r\n", "\n").replace("\n", "<br>") + "</div>"
+
+    used_cids = []
+    html_marked = html_replace_imgs(html, used_cids)
+
+    # Collect attachments
+    inline = []
+    attachments = []
+    for att in getattr(msg, "attachments", []) or []:
+        # filename
+        fn = getattr(att, "longFilename", None) or getattr(att, "shortFilename", None) or "attachment"
+        # bytes
+        data = getattr(att, "data", None)
+        if not data:
+            try:
+                data = att.data
+            except Exception:
+                data = None
+        if not data:
+            continue
+        # mime
+        mime = getattr(att, "mimetype", None) or mimetypes.guess_type(fn)[0] or "application/octet-stream"
+        # possible content-id
+        cid = None
+        for name in ("contentId", "content_id", "cid", "attachContentId", "pidTagAttachContentId"):
+            if hasattr(att, name):
+                cid = getattr(att, name)
+                break
+        # Some libs store it in props dict – best-effort scan
+        if not cid and hasattr(att, "props"):
+            props = getattr(att, "props") or {}
+            for k, v in props.items():
+                if isinstance(v, str) and "@" in v and len(v) < 200:
+                    # heuristic
+                    cid = v
+                    break
+        cid_norm = norm_cid(cid or "")
+        record = {
+            "filename": fn,
+            "contentType": mime,
+            "dataBase64": b64(data)
         }
+        if cid_norm:
+            record["cid"] = cid_norm
+
+        # If it’s referenced in HTML by CID -> inline
+        if cid_norm and cid_norm in used_cids:
+            inline.append(record)
+        else:
+            attachments.append(record)
+
+    out = {
+        "subject": subject,
+        "from": from_,
+        "to": to,
+        "cc": cc,
+        "date": iso(msg_message_date),
+        "html_marked": html_marked,
+        "inline": inline,
+        "attachments": attachments
     }
+    print(json.dumps(out))
+    return 0
 
 def main():
-    if len(sys.argv) < 2:
-        print(json.dumps({ "ok": False, "error": "path arg missing" }))
-        return
-    p = sys.argv[1]
-    ext = os.path.splitext(p)[1].lower()
+    if len(sys.argv) != 2:
+        print(json.dumps({"ok": False, "error": "Usage: msg_to_json.py <path>"}))
+        return 1
+    path = sys.argv[1]
     try:
-        out = parse_msg(p) if ext == '.msg' else parse_eml(p)
-        print(json.dumps(out, ensure_ascii=False))
+        return load_msg(path)
     except Exception as e:
-        print(json.dumps({ "ok": False, "error": str(e) }))
+        print(json.dumps({"ok": False, "error": str(e)}))
+        return 2
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
