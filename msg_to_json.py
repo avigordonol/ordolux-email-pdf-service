@@ -1,89 +1,117 @@
 #!/usr/bin/env python3
-import sys, json, base64, datetime
+import sys, json, base64, mimetypes, datetime
+from bs4 import BeautifulSoup
 
-def default(o):
-    if isinstance(o, (datetime.datetime, datetime.date)):
-        return o.isoformat()
-    raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
+# extract_msg imports
+import extract_msg
+from striprtf.striprtf import rtf_to_text
 
-def norm(s):
-    if s is None:
-        return None
-    if isinstance(s, bytes):
+def to_iso(dt):
+    if isinstance(dt, datetime.datetime):
         try:
-            return s.decode("utf-8", errors="replace")
+            return dt.isoformat()
         except Exception:
-            return s.decode("latin-1", errors="replace")
-    return str(s)
+            return str(dt)
+    return str(dt) if dt is not None else None
+
+def safe_text_from_html(html):
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        # collapse excessive whitespace but keep line breaks for paragraphs
+        for br in soup.find_all(["br", "p", "div", "li"]):
+            br.insert_after("\n")
+        txt = soup.get_text()
+        # normalize spaces
+        return "\n".join([line.strip() for line in txt.splitlines() if line.strip() != ""])
+    except Exception:
+        return None
+
+def body_variants(msg):
+    html = getattr(msg, "htmlBody", None)
+    text = getattr(msg, "body", None)
+
+    if html and isinstance(html, (str, bytes)):
+        if isinstance(html, bytes):
+            try: html = html.decode("utf-8", "ignore")
+            except Exception: html = html.decode("latin-1", "ignore")
+        text_from_html = safe_text_from_html(html)
+        return {"body_html": html, "body_text": text_from_html or text or ""}
+
+    # Fallback: try RTF -> text
+    rtf = getattr(msg, "rtfBody", None)
+    if rtf and isinstance(rtf, (bytes, bytearray)):
+        try:
+            rtf_str = rtf.decode("latin-1", "ignore")
+        except Exception:
+            rtf_str = str(rtf)
+        try:
+            text_from_rtf = rtf_to_text(rtf_str)
+            return {"body_html": None, "body_text": text_from_rtf}
+        except Exception:
+            pass
+
+    return {"body_html": None, "body_text": text or ""}
+
+def gather_attachments(msg):
+    atts = []
+    try:
+        for a in msg.attachments:
+            name = getattr(a, "longFilename", None) or getattr(a, "shortFilename", None) or "attachment"
+            data = getattr(a, "data", None)
+            cid  = getattr(a, "cid", None) or getattr(a, "contentId", None) or getattr(a, "content_id", None)
+            mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+
+            entry = {
+                "filename": name,
+                "content_type": mime,
+                "content_id": cid,
+                "is_inline": bool(cid)
+            }
+
+            # Include bytes for inline images so Node can render them in-PDF
+            if data and mime.startswith("image/") and entry["is_inline"]:
+                entry["data_base64"] = base64.b64encode(data).decode("ascii")
+
+            atts.append(entry)
+    except Exception:
+        pass
+    return atts
 
 def main():
     if len(sys.argv) < 2:
-        print(json.dumps({"error":"missing path"}))
+        print(json.dumps({"error": "usage: msg_to_json.py <path>"}))
         return
 
     path = sys.argv[1]
-
-    # Lazy import so python -c check is quick
-    import extract_msg
-
     msg = extract_msg.Message(path)
-    msg_message = msg
+    msg_sender = getattr(msg, "sender", None) or getattr(msg, "senderName", None)
+    msg_to = getattr(msg, "to", None)
+    msg_cc = getattr(msg, "cc", None)
+    msg_subj = getattr(msg, "subject", None)
+    msg_date = to_iso(getattr(msg, "date", None))
 
-    subject = norm(getattr(msg_message, "subject", None))
-    sender  = norm(getattr(msg_message, "sender", None) or getattr(msg_message, "sender_email", None))
-    to_     = norm(getattr(msg_message, "to", None))
-    cc_     = norm(getattr(msg_message, "cc", None))
-    date    = getattr(msg_message, "date", None)
-
-    # Bodies
-    html = norm(getattr(msg_message, "htmlBody", None))
-    text = norm(getattr(msg_message, "body", None))
-
-    # Attachments (inline + regular)
-    atts = []
-    try:
-        for a in (getattr(msg_message, "attachments", []) or []):
-            fn = norm(getattr(a, "longFilename", None) or getattr(a, "shortFilename", None))
-            ct = norm(getattr(a, "mimetype", None) or getattr(a, "mimeType", None))
-            cid = norm(getattr(a, "cid", None) or getattr(a, "contentId", None))
-            # data attribute may be bytes or has a .data property depending on version
-            data = getattr(a, "data", None)
-            if data is None and hasattr(a, "getData"):
-                data = a.getData()
-            if data is None and hasattr(a, "data"):
-                data = a.data
-            if isinstance(data, memoryview):
-                data = data.tobytes()
-            if data is None:
-                continue
-            atts.append({
-                "filename": fn or "",
-                "contentType": ct or "application/octet-stream",
-                "contentId": cid or "",
-                "isInline": bool(cid),
-                "dataBase64": base64.b64encode(data).decode("ascii")
-            })
-    except Exception as e:
-        # Don't fail conversion if attachments parsing is odd
-        atts = []
+    bodies = body_variants(msg)
+    atts = gather_attachments(msg)
 
     out = {
-        "kind": "msg",
-        "headers": {
-            "from": sender,
-            "to": to_,
-            "cc": cc_,
-            "subject": subject,
-            "date": date
+        "meta": {
+            "source": "msg",
+            "has_html": bool(bodies.get("body_html")),
+            "attachment_count": len(atts)
         },
-        "body": {
-            "html": html,
-            "text": text
-        },
-        "attachments": atts
+        "message": {
+            "from": msg_sender,
+            "to": msg_to,
+            "cc": msg_cc,
+            "subject": msg_subj,
+            "date": msg_date,
+            "body_html": bodies.get("body_html"),
+            "body_text": bodies.get("body_text"),
+            "attachments": atts
+        }
     }
-
-    print(json.dumps(out, default=default))
+    print(json.dumps(out))
+    msg.close()
 
 if __name__ == "__main__":
     main()
