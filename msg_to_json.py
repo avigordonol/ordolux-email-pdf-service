@@ -1,103 +1,140 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# Reads a .msg and emits JSON with:
+# - headers (subject/from/to/cc/date)
+# - html_marked (IMG tags -> [[IMG:<cid>]] tokens)
+# - inline (list of inline images with cid/filename/mime/dataBase64)
+# - attachments (non-inline)
+import sys, json, base64, re, mimetypes
+from datetime import datetime
 
-import sys, os, json, base64
-from datetime import datetime, date
-try:
+def b64(data: bytes) -> str:
+    return base64.b64encode(data).decode('ascii')
+
+def iso(dt):
+    if isinstance(dt, datetime):
+        try:
+            return dt.isoformat()
+        except Exception:
+            return str(dt)
+    return dt
+
+def norm_cid(s: str) -> str:
+    if not s: return ""
+    s = s.strip().strip("<>").strip().lower()
+    if s.startswith("cid:"): s = s[4:]
+    # strip any fragment or query
+    s = re.split(r"[?#]", s, 1)[0]
+    return s
+
+def html_replace_imgs(html: str, used_cids: list) -> str:
+    if not html:
+        return ""
+    # Replace <img src="cid:..."> with [[IMG:cid]]
+    def repl(m):
+        cid = norm_cid(m.group(1))
+        used_cids.append(cid)
+        return f"[[IMG:{cid}]]"
+    pattern = re.compile(r'<img\b[^>]*src=[\'"]cid:([^\'">]+)[\'"][^>]*>', re.IGNORECASE)
+    html2 = pattern.sub(repl, html)
+    return html2
+
+def load_msg(path: str):
     import extract_msg
-except Exception as e:
-    print(json.dumps({"ok": False, "error": f"extract_msg import failed: {e}"}))
-    sys.exit(1)
+    from compressed_rtf import rtf_to_text
 
-def _to_jsonable(x):
-    """Convert values so json.dumps won't choke (datetime, bytes, etc.)."""
-    if isinstance(x, (datetime, date)):
-        try:
-            return x.isoformat()
-        except Exception:
-            return str(x)
-    if isinstance(x, bytes):
-        try:
-            return x.decode("utf-8", "replace")
-        except Exception:
-            return base64.b64encode(x).decode("ascii")
-    return x
+    msg = extract_msg.Message(path)
+    msg_message_date = getattr(msg, "date", None) or getattr(msg, "sentOn", None)
 
-def _normalize(obj):
-    if isinstance(obj, dict):
-        return {str(k): _normalize(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_normalize(v) for v in obj]
-    return _to_jsonable(obj)
+    subject = getattr(msg, "subject", "") or ""
+    from_   = getattr(msg, "sender", "") or ""
+    to      = getattr(msg, "to", "") or ""
+    cc      = getattr(msg, "cc", "") or ""
 
-def main():
-    if len(sys.argv) < 2:
-        print(json.dumps({"ok": False, "error": "usage: msg_to_json.py <file.msg>"}))
-        return 1
-
-    path = sys.argv[1]
-    if not os.path.exists(path):
-        print(json.dumps({"ok": False, "error": f"file not found: {path}"}))
-        return 1
-
-    try:
-        msg = extract_msg.Message(path)
-        msg_message_id = getattr(msg, "message_id", None)
-        # Bodies
-        text_body = getattr(msg, "body", None) or ""
-        html_body = getattr(msg, "htmlBody", None) or ""
-
-        # Headers
-        headers = {
-            "from":   getattr(msg, "sender", None) or getattr(msg, "sender_email", None) or "",
-            "to":     getattr(msg, "to", None) or "",
-            "cc":     getattr(msg, "cc", None) or "",
-            "bcc":    getattr(msg, "bcc", None) or "",
-            "subject":getattr(msg, "subject", None) or "",
-            "date":   getattr(msg, "date", None),          # may be datetime; _normalize() will fix
-            "message_id": msg_message_id,
-        }
-
-        # Attachments (include minimal safe info + base64 data for merge)
-        atts = []
-        for a in getattr(msg, "attachments", []):
+    html = getattr(msg, "htmlBody", None)
+    if not html:
+        # fall back to RTF -> text -> very simple HTML
+        rtf = getattr(msg, "rtfBody", None)
+        if rtf:
             try:
-                fname = getattr(a, "longFilename", None) or getattr(a, "shortFilename", None) or "attachment"
+                text = rtf_to_text(rtf)
             except Exception:
-                fname = "attachment"
+                text = getattr(msg, "body", "") or ""
+        else:
+            text = getattr(msg, "body", "") or ""
+        html = "<div>" + (text or "").replace("\r\n", "\n").replace("\n", "<br>") + "</div>"
+
+    used_cids = []
+    html_marked = html_replace_imgs(html, used_cids)
+
+    # Collect attachments
+    inline = []
+    attachments = []
+    for att in getattr(msg, "attachments", []) or []:
+        # filename
+        fn = getattr(att, "longFilename", None) or getattr(att, "shortFilename", None) or "attachment"
+        # bytes
+        data = getattr(att, "data", None)
+        if not data:
             try:
-                data = getattr(a, "data", None)
+                data = att.data
             except Exception:
                 data = None
-            size = len(data) if isinstance(data, (bytes, bytearray)) else 0
-            content_id = getattr(a, "cid", None) or getattr(a, "contentId", None)
-            mimetype = getattr(a, "mimetype", None)  # may be None; server can guess
-            # base64 the data so Node can merge PDFs if desired
-            b64 = base64.b64encode(data).decode("ascii") if data else None
+        if not data:
+            continue
+        # mime
+        mime = getattr(att, "mimetype", None) or mimetypes.guess_type(fn)[0] or "application/octet-stream"
+        # possible content-id
+        cid = None
+        for name in ("contentId", "content_id", "cid", "attachContentId", "pidTagAttachContentId"):
+            if hasattr(att, name):
+                cid = getattr(att, name)
+                break
+        # Some libs store it in props dict – best-effort scan
+        if not cid and hasattr(att, "props"):
+            props = getattr(att, "props") or {}
+            for k, v in props.items():
+                if isinstance(v, str) and "@" in v and len(v) < 200:
+                    # heuristic
+                    cid = v
+                    break
+        cid_norm = norm_cid(cid or "")
+        record = {
+            "filename": fn,
+            "contentType": mime,
+            "dataBase64": b64(data)
+        }
+        if cid_norm:
+            record["cid"] = cid_norm
 
-            atts.append({
-                "filename": fname,
-                "contentId": content_id,
-                "contentType": mimetype,
-                "size": size,
-                "isInline": bool(content_id),
-                "data_b64": b64,
-            })
+        # If it’s referenced in HTML by CID -> inline
+        if cid_norm and cid_norm in used_cids:
+            inline.append(record)
+        else:
+            attachments.append(record)
 
-        out = _normalize({
-            "ok": True,
-            "headers": headers,
-            "text": text_body,
-            "html": html_body,
-            "attachments": atts,
-        })
+    out = {
+        "subject": subject,
+        "from": from_,
+        "to": to,
+        "cc": cc,
+        "date": iso(msg_message_date),
+        "html_marked": html_marked,
+        "inline": inline,
+        "attachments": attachments
+    }
+    print(json.dumps(out))
+    return 0
 
-        print(json.dumps(out, ensure_ascii=False))
-        return 0
-
-    except Exception as e:
-        print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}))
+def main():
+    if len(sys.argv) != 2:
+        print(json.dumps({"ok": False, "error": "Usage: msg_to_json.py <path>"}))
         return 1
+    path = sys.argv[1]
+    try:
+        return load_msg(path)
+    except Exception as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        return 2
 
 if __name__ == "__main__":
     sys.exit(main())
