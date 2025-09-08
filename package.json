@@ -2,16 +2,13 @@
   "name": "ordolux-email-pdf-service",
   "version": "1.0.0",
   "private": true,
-  "description": "Convert EML/MSG to a neat PDF (inline images supported)",
   "main": "server.cjs",
   "scripts": {
     "start": "node server.cjs"
   },
   "dependencies": {
     "express": "4.19.2",
-    "mailparser": "3.9.2",
-    "pdfkit": "0.13.0",
-    "he": "1.2.0",
-    "html-to-text": "9.0.5"
+    "mailparser": "3.6.7",
+    "pdfkit": "0.13.0"
   }
 }
