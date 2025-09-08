@@ -1,17 +1,17 @@
-# Lightweight Node + Python env
 FROM node:20-slim
 
-# System deps (fonts help PDF rendering)
+# Python (for .msg parsing) + fonts
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-venv python3-pip \
-      fonts-dejavu-core ca-certificates \
+      fonts-dejavu-core \
+      ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Dedicated Python venv (avoids PEP 668 issues)
+# Isolated Python env to avoid PEP 668 issues
 RUN python3 -m venv /opt/pyenv
 ENV PATH="/opt/pyenv/bin:${PATH}"
 
-# Python libs for .msg parsing
+# Python libs for MSG parsing
 RUN pip install --no-cache-dir \
       extract_msg==0.55.0 \
       olefile==0.47 \
@@ -22,7 +22,7 @@ RUN pip install --no-cache-dir \
 
 WORKDIR /app
 
-# Install Node deps
+# Install Node deps first (layer caching)
 COPY package.json ./
 RUN npm install --omit=dev
 
