@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Isolated Python env (fixes PEP 668)
+# Isolated Python env (PEP 668-safe)
 RUN python3 -m venv /opt/pyenv
 ENV PATH="/opt/pyenv/bin:${PATH}"
 
@@ -22,7 +22,7 @@ RUN pip install --no-cache-dir \
 
 WORKDIR /app
 
-# Node deps
+# Install Node deps
 COPY package.json ./
 RUN npm install --omit=dev
 
