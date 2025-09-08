@@ -1,227 +1,159 @@
-// server.js — EML + MSG (MSG via Python helper), optional merge of PDF attachments
-import express from 'express';
-import PDFDocument from 'pdfkit';
-import { simpleParser } from 'mailparser';
-import { spawn } from 'node:child_process';
-import { PDFDocument as PdfLib } from 'pdf-lib';
-
-const PORT = process.env.PORT || 3000;
-const SHARED_SECRET = process.env.SHARED_SECRET || '';
+/* CommonJS server with .eml + .msg support.
+   - EML: parsed with mailparser
+   - MSG: parsed via /opt/pyenv/bin/python msg_to_json.py (extract_msg)
+   - Renders a cover PDF with PDFKit, and merges any PDF attachments using pdf-lib
+*/
+const express = require('express');
+const { simpleParser } = require('mailparser');
+const PDFDocument = require('pdfkit');
+const { PDFDocument: PDFLib } = require('pdf-lib');
+const crypto = require('crypto');
+const { spawn } = require('child_process');
 
 const app = express();
-app.use(express.json({ limit: '25mb' }));
+const PORT = process.env.PORT || 3000;
+const SHARED_SECRET = process.env.SHARED_SECRET || ''; // you already set this in Railway
 
-// ---------- utils ----------
-function errJson(res, status, msg, extra = {}) {
-  return res.status(status).json({ ok: false, error: msg, ...extra });
-}
-function safePdfName(name) {
-  const base = String(name || 'Email').replace(/\.[^.]+$/, '');
-  return (base || 'Email') + '.pdf';
-}
-function stripHtml(html) {
-  if (!html) return '';
-  let s = String(html);
-  s = s.replace(/<\s*script[\s\S]*?<\/\s*script\s*>/gi, '');
-  s = s.replace(/<\s*style[\s\S]*?<\/\s*style\s*>/gi, '');
-  s = s.replace(/<br\s*\/?>/gi, '\n');
-  s = s.replace(/<\/p>/gi, '\n');
-  s = s.replace(/<\/li>/gi, '\n• ');
-  s = s.replace(/<[^>]+>/g, '');
-  s = s.replace(/\r/g, '').replace(/\n{3,}/g, '\n\n').trim();
-  return s;
-}
-function showAddr(addr) {
-  if (!addr) return '';
-  try {
-    if (addr.text) return addr.text;
-    if (addr.value && Array.isArray(addr.value) && addr.value.length) {
-      return addr.value
-        .map(v => v.address ? `${v.name ? (v.name + ' ') : ''}<${v.address}>` : (v.name || ''))
-        .join(', ');
-    }
-  } catch {}
-  return '';
-}
-function showAddrs(a) { return showAddr(a); }
+app.use(express.json({ limit: '30mb' }));
 
-function renderCoverPdfToBuffer({ subject, meta, bodyText }) {
-  return new Promise((resolve, reject) => {
-    const doc = new PDFDocument({ size: 'A4', margin: 40 });
-    const chunks = [];
-    doc.on('data', c => chunks.push(c));
-    doc.on('end', () => resolve(Buffer.concat(chunks)));
-    doc.on('error', reject);
-
-    // Title
-    doc.fontSize(18).text(subject || '(no subject)');
-    doc.moveDown(0.5);
-
-    // Meta
-    doc.fontSize(10);
-    const hdrs = [
-      ['From', meta.From || ''],
-      ['To',   meta.To   || ''],
-      ['Cc',   meta.Cc   || ''],
-      ['Date', meta.Date || '']
-    ];
-    hdrs.forEach(([k, v]) => { if (v) doc.text(`${k}: ${v}`); });
-    doc.moveDown(0.5);
-    doc.moveTo(doc.x, doc.y).lineTo(doc.page.width - doc.page.margins.right, doc.y).stroke();
-    doc.moveDown(0.75);
-
-    // Body
-    doc.fontSize(12).text(bodyText || '(no body)', { align: 'left' });
-
-    doc.end();
-  });
-}
-
-async function mergePdfs(buffers) {
-  const merged = await PdfLib.create();
-  for (const buf of buffers) {
-    const src = await PdfLib.load(buf);
-    const pages = await merged.copyPages(src, src.getPageIndices());
-    pages.forEach(p => merged.addPage(p));
-  }
-  const out = await merged.save();
-  return Buffer.from(out);
-}
-
-function wantPdf(req) {
-  const a = (req.headers['accept'] || '').toLowerCase();
-  return a.includes('application/pdf');
-}
-
-function pythonCmd() {
-  // We install a venv at /opt/pyenv in the Dockerfile
-  return process.env.PYTHON || '/opt/pyenv/bin/python';
-}
-
-function parseMsgViaPython(fileBase64, filename) {
-  return new Promise((resolve, reject) => {
-    const p = spawn(pythonCmd(), ['/app/py/parse_msg.py']);
-    let stdout = '', stderr = '';
-    p.stdout.setEncoding('utf8');
-    p.stderr.setEncoding('utf8');
-    p.stdout.on('data', d => stdout += d);
-    p.stderr.on('data', d => stderr += d);
-    p.on('error', reject);
-    p.on('close', (_code) => {
-      try {
-        const j = JSON.parse(stdout || '{}');
-        resolve(j);
-      } catch (e) {
-        reject(new Error('Python JSON parse failed: ' + e + ' stderr: ' + stderr));
-      }
-    });
-    p.stdin.end(JSON.stringify({ fileBase64, filename }));
-  });
-}
-
-// ---------- routes ----------
 app.get('/healthz', (req, res) => {
-  if (SHARED_SECRET && req.headers['x-ordolux-secret'] !== SHARED_SECRET) {
-    return errJson(res, 401, 'unauthorized');
-  }
-  res.json({ ok: true });
+  const ok = req.header('X-Ordolux-Secret') === SHARED_SECRET;
+  res.status(ok ? 200 : 401).json({ ok });
 });
 
 app.post('/convert', async (req, res) => {
   try {
-    if (SHARED_SECRET && req.headers['x-ordolux-secret'] !== SHARED_SECRET) {
-      return errJson(res, 401, 'Invalid secret');
+    if (req.header('X-Ordolux-Secret') !== SHARED_SECRET) {
+      return res.status(401).json({ ok: false, error: 'Unauthorized' });
     }
-
-    const { fileBase64, filename = '', options = {} } = req.body || {};
+    const { fileBase64, filename, options = {} } = req.body || {};
     if (!fileBase64 || !filename) {
-      return errJson(res, 400, 'Missing fileBase64 or filename');
+      return res.status(422).json({ ok: false, error: 'Missing fileBase64 or filename' });
     }
 
-    const lower = String(filename).toLowerCase().trim();
-    const isEML = lower.endsWith('.eml');
-    const isMSG = lower.endsWith('.msg');
+    const bytes = Buffer.from(fileBase64, 'base64');
+    const isEML = /\.eml$/i.test(filename);
+    const isMSG = /\.msg$/i.test(filename);
 
-    // Decode once
-    let raw;
-    try {
-      raw = Buffer.from(fileBase64, 'base64');
-    } catch {
-      return errJson(res, 400, 'Invalid base64');
-    }
+    let cover = null;           // { title, headers (obj), bodyText }
+    let pdfAttachments = [];    // [{ filename, bytes }]
 
-    // ---- MSG path (via Python) ----
-    if (isMSG) {
-      const parsed = await parseMsgViaPython(fileBase64, filename);
-      if (!parsed || parsed.ok === false) {
-        return errJson(res, 422, 'Failed to parse MSG', { detail: parsed?.error || 'unknown' });
-      }
-
-      const meta = {
-        From: parsed.from || '',
-        To: parsed.to || '',
-        Cc: parsed.cc || '',
-        Date: parsed.date || ''
+    if (isEML) {
+      // Parse with mailparser
+      const parsed = await simpleParser(bytes);
+      cover = {
+        title: parsed.subject || '(no subject)',
+        headers: {
+          From: parsed.from && parsed.from.text || '',
+          To: parsed.to && parsed.to.text || '',
+          Cc: parsed.cc && parsed.cc.text || '',
+          Date: parsed.date ? parsed.date.toISOString() : ''
+        },
+        bodyText: (parsed.text || parsed.html || '').toString()
       };
-      const cover = await renderCoverPdfToBuffer({
-        subject: parsed.subject || '(no subject)',
-        meta,
-        bodyText: parsed.bodyText || ''
-      });
-
-      let finalPdf = cover;
-      if (options.mergeAttachments && Array.isArray(parsed.attachments) && parsed.attachments.length) {
-        const pdfAtts = parsed.attachments
-          .filter(a => (a.contentType || '').includes('pdf') && a.dataBase64)
-          .map(a => Buffer.from(a.dataBase64, 'base64'));
-        if (pdfAtts.length) {
-          finalPdf = await mergePdfs([cover, ...pdfAtts]);
+      // If there are PDFs attached and merge requested, collect them
+      if (options.mergeAttachments && parsed.attachments && parsed.attachments.length) {
+        for (const a of parsed.attachments) {
+          if ((a.contentType || '').toLowerCase() === 'application/pdf') {
+            pdfAttachments.push({ filename: a.filename || 'attachment.pdf', bytes: Buffer.from(a.content) });
+          }
         }
       }
+    } else if (isMSG) {
+      // Hand off to Python helper (extract_msg)
+      const py = spawn('/opt/pyenv/bin/python', ['-u', 'msg_to_json.py'], { stdio: ['pipe', 'pipe', 'pipe'] });
+      const payload = JSON.stringify({ fileBase64 });
+      py.stdin.write(payload); py.stdin.end();
 
-      res.setHeader('Content-Type', 'application/pdf');
-      res.setHeader('Content-Disposition', `inline; filename="${safePdfName(filename)}"`);
-      return res.end(finalPdf);
+      let out = '', err = '';
+      py.stdout.on('data', d => out += d.toString());
+      py.stderr.on('data', d => err += d.toString());
+      const code = await new Promise(resolve => py.on('close', resolve));
+
+      if (code !== 0) {
+        return res.status(500).json({ ok: false, error: 'Python exited ' + code, stderr: err });
+      }
+      let j;
+      try { j = JSON.parse(out); } catch (e) {
+        return res.status(500).json({ ok: false, error: 'Bad JSON from python', out });
+      }
+      if (!j.ok) return res.status(422).json({ ok: false, error: j.error || 'MSG parse failed' });
+
+      const m = j.message || {};
+      cover = {
+        title: m.subject || '(no subject)',
+        headers: { From: m.from || '', To: m.to || '', Cc: m.cc || '', Date: m.date || '' },
+        bodyText: m.bodyText || ''
+      };
+      if (options.mergeAttachments && Array.isArray(m.attachments)) {
+        for (const a of m.attachments) {
+          if ((a.content_type || '').toLowerCase() === 'application/pdf' && a.base64) {
+            pdfAttachments.push({ filename: a.filename || 'attachment.pdf', bytes: Buffer.from(a.base64, 'base64') });
+          }
+        }
+      }
+    } else {
+      return res.status(422).json({ ok: false, error: 'Unsupported file type (use .eml or .msg)' });
     }
 
-    // ---- EML path ----
-    if (!isEML) {
-      return errJson(res, 400, 'Unsupported extension; send .eml or .msg');
-    }
+    // Render the cover email to a PDF buffer
+    const coverPdf = await renderCoverPdf(cover);
 
-    let mail;
-    try {
-      mail = await simpleParser(raw);
-    } catch (e) {
-      return errJson(res, 422, 'Failed to parse EML', { detail: String(e?.message || e) });
-    }
+    // Merge attachments (PDF only) after the cover
+    const merged = await mergePdfs(coverPdf, pdfAttachments);
 
-    const textBody = (mail.text || '').trim();
-    const htmlBody = (mail.html && typeof mail.html === 'string') ? mail.html : '';
-    const body = textBody || stripHtml(htmlBody) || '(no body)';
-    const meta = {
-      From: showAddr(mail.from),
-      To: showAddrs(mail.to),
-      Cc: showAddrs(mail.cc),
-      Date: mail.date ? new Date(mail.date).toString() : ''
-    };
-
-    const cover = await renderCoverPdfToBuffer({
-      subject: mail.subject || '(no subject)',
-      meta,
-      bodyText: body
-    });
-
-    // NOTE: In this build we only merge PDF attachments when source is MSG.
-    // EML merges can be added later if needed.
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `inline; filename="${safePdfName(filename)}"`);
-    return res.end(cover);
+    res.setHeader('Content-Disposition', `inline; filename="${safeName(filename)}.pdf"`);
+    return res.status(200).send(Buffer.from(merged));
   } catch (e) {
-    return errJson(res, 500, 'Unhandled error', { detail: String(e?.message || e) });
+    console.error(e);
+    res.status(500).json({ ok: false, error: String(e && e.message || e) });
   }
 });
 
-app.listen(PORT, () => {
-  console.log('OrdoLux Email→PDF listening on :' + PORT);
-});
+app.listen(PORT, () => console.log('listening on', PORT));
+
+function safeName(n) {
+  return String(n || 'email').replace(/\.[^.]+$/, '').replace(/[^\w\-. ]+/g, '_');
+}
+function renderCoverPdf({ title, headers, bodyText }) {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ size: 'A4', margin: 40 });
+    const chunks = [];
+    doc.on('data', d => chunks.push(d));
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+
+    doc.fontSize(18).font('Helvetica-Bold').text(title || '(no subject)');
+    doc.moveDown(0.5);
+    doc.fontSize(11).font('Helvetica');
+    const order = ['From','To','Cc','Date'];
+    order.forEach(k => {
+      const v = headers && headers[k] ? String(headers[k]) : '';
+      if (v.trim()) doc.text(`${k}: ${v}`);
+    });
+    doc.moveDown(0.5);
+    doc.moveTo(doc.x, doc.y).lineTo(555, doc.y).strokeColor('#888').stroke();
+    doc.moveDown(0.75);
+
+    const body = (bodyText || '').toString();
+    doc.fontSize(12).fillColor('#000').text(body.length ? body : '(no body)', { align: 'left' });
+
+    doc.end();
+  });
+}
+async function mergePdfs(coverPdfBuf, attachmentList) {
+  // Start with the cover
+  let outDoc = await PDFLib.load(coverPdfBuf);
+  for (const att of (attachmentList || [])) {
+    try {
+      const attDoc = await PDFLib.load(att.bytes);
+      const pages = await outDoc.copyPages(attDoc, attDoc.getPageIndices());
+      pages.forEach(p => outDoc.addPage(p));
+    } catch (e) {
+      // skip bad PDFs but continue
+      console.error('skip bad attachment', att.filename, e.message);
+    }
+  }
+  return await outDoc.save();
+}
