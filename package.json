@@ -2,7 +2,6 @@
   "name": "ordolux-email-pdf-service",
   "version": "1.0.0",
   "private": true,
-  "type": "commonjs",
   "main": "server.cjs",
   "scripts": {
     "start": "node server.cjs"
@@ -10,7 +9,7 @@
   "dependencies": {
     "express": "4.19.2",
     "mailparser": "3.6.7",
-    "pdfkit": "0.13.0",
-    "pdf-lib": "1.17.1"
+    "pdf-lib": "1.17.1",
+    "tmp": "0.2.3"
   }
 }
