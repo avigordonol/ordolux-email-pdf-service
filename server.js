@@ -1,159 +1,202 @@
-/* CommonJS server with .eml + .msg support.
-   - EML: parsed with mailparser
-   - MSG: parsed via /opt/pyenv/bin/python msg_to_json.py (extract_msg)
-   - Renders a cover PDF with PDFKit, and merges any PDF attachments using pdf-lib
-*/
-const express = require('express');
-const { simpleParser } = require('mailparser');
-const PDFDocument = require('pdfkit');
-const { PDFDocument: PDFLib } = require('pdf-lib');
-const crypto = require('crypto');
-const { spawn } = require('child_process');
+// OrdoLux Email → PDF microservice (Railway)
+// - Accepts fileBase64 or fileUrl + filename
+// - Auth via X-Ordolux-Secret
+// - Parses .eml via mailparser, .msg via Python extract_msg
+// - Streams a real PDF using pdfkit
+// - Normalizes text to avoid stray "Ð" etc.
+
+const express         = require('express');
+const { simpleParser }= require('mailparser');
+const PDFDocument     = require('pdfkit');
+const fs              = require('fs');
+const os              = require('os');
+const path            = require('path');
+const http            = require('http');
+const https           = require('https');
+const { spawnSync }   = require('child_process');
+
+const SHARED_SECRET = process.env.SHARED_SECRET || '';
+const PORT          = process.env.PORT || 8080;
+
+// ------------------------- helpers -------------------------
+
+function normalizeText(s = '') {
+  return String(s)
+    .replace(/\r\n/g, '\n')  // CRLF -> LF
+    .replace(/\r/g, '\n')    // lone CR -> LF
+    .replace(/\u00A0/g, ' ') // NBSP -> normal space
+    .replace(/\u200B/g, '')  // zero-width space
+    .replace(/\uFEFF/g, '')  // BOM
+    .replace(/\u0000/g, ''); // stray NULs
+}
+
+function fetchUrl(url) {
+  return new Promise((resolve, reject) => {
+    const client = url.startsWith('https') ? https : http;
+    const req = client.get(url, res => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        return resolve(fetchUrl(res.headers.location));
+      }
+      if (res.statusCode !== 200) {
+        return reject(new Error(`HTTP ${res.statusCode}`));
+      }
+      const chunks = [];
+      res.on('data', d => chunks.push(d));
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+    });
+    req.on('error', reject);
+  });
+}
+
+function writeTmp(buf, ext) {
+  const p = path.join(
+    os.tmpdir(),
+    `ordolux-${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`
+  );
+  fs.writeFileSync(p, buf);
+  return p;
+}
+
+function parseMsgWithPython(tmpPath) {
+  const py = '/opt/pyenv/bin/python';
+  const code = `
+import sys, json
+try:
+    import extract_msg
+except Exception as e:
+    print(json.dumps({"ok": False, "error": "extract_msg-not-available", "detail": str(e)}))
+    sys.exit(0)
+
+p = sys.argv[1]
+try:
+    msg = extract_msg.Message(p)
+    subject = getattr(msg, 'subject', '') or ''
+    body = getattr(msg, 'body', '') or getattr(msg, 'body_text', '') or ''
+    sender = getattr(msg, 'sender', '') or getattr(msg, 'sender_name', '') or ''
+    to = getattr(msg, 'to', '') or ''
+    cc = getattr(msg, 'cc', '') or ''
+    date = str(getattr(msg, 'date', '') or '')
+    out = {"ok": True, "subject": subject, "body": body, "from": sender, "to": to, "cc": cc, "date": date}
+    print(json.dumps(out, ensure_ascii=False))
+except Exception as e:
+    print(json.dumps({"ok": False, "error": "msg-parse-failed", "detail": str(e)}))
+`;
+  const r = spawnSync(py, ['-c', code, tmpPath], { encoding: 'utf8' });
+  if (r.error) return { ok: false, error: String(r.error) };
+
+  const text = (r.stdout || '').trim();
+  try { return JSON.parse(text || '{}'); }
+  catch { return { ok: false, error: 'bad-json-from-python', detail: text }; }
+}
+
+// ------------------------- app -------------------------
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-const SHARED_SECRET = process.env.SHARED_SECRET || ''; // you already set this in Railway
-
-app.use(express.json({ limit: '30mb' }));
+app.use(express.json({ limit: '50mb' }));
 
 app.get('/healthz', (req, res) => {
-  const ok = req.header('X-Ordolux-Secret') === SHARED_SECRET;
-  res.status(ok ? 200 : 401).json({ ok });
+  if (SHARED_SECRET && req.get('X-Ordolux-Secret') !== SHARED_SECRET) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+  res.json({ ok: true });
 });
 
 app.post('/convert', async (req, res) => {
   try {
-    if (req.header('X-Ordolux-Secret') !== SHARED_SECRET) {
-      return res.status(401).json({ ok: false, error: 'Unauthorized' });
-    }
-    const { fileBase64, filename, options = {} } = req.body || {};
-    if (!fileBase64 || !filename) {
-      return res.status(422).json({ ok: false, error: 'Missing fileBase64 or filename' });
+    if (SHARED_SECRET && req.get('X-Ordolux-Secret') !== SHARED_SECRET) {
+      return res.status(401).json({ ok: false, error: 'unauthorized' });
     }
 
-    const bytes = Buffer.from(fileBase64, 'base64');
-    const isEML = /\.eml$/i.test(filename);
-    const isMSG = /\.msg$/i.test(filename);
+    const { fileBase64, fileUrl, filename = 'Email.eml', options = {} } = req.body || {};
+    if (!fileBase64 && !fileUrl) {
+      return res.status(422).json({ ok: false, error: 'missing fileBase64 or fileUrl' });
+    }
 
-    let cover = null;           // { title, headers (obj), bodyText }
-    let pdfAttachments = [];    // [{ filename, bytes }]
+    // Get file bytes
+    let buf;
+    if (fileBase64) buf = Buffer.from(fileBase64, 'base64');
+    else            buf = await fetchUrl(fileUrl);
 
-    if (isEML) {
-      // Parse with mailparser
-      const parsed = await simpleParser(bytes);
-      cover = {
-        title: parsed.subject || '(no subject)',
-        headers: {
-          From: parsed.from && parsed.from.text || '',
-          To: parsed.to && parsed.to.text || '',
-          Cc: parsed.cc && parsed.cc.text || '',
-          Date: parsed.date ? parsed.date.toISOString() : ''
-        },
-        bodyText: (parsed.text || parsed.html || '').toString()
-      };
-      // If there are PDFs attached and merge requested, collect them
-      if (options.mergeAttachments && parsed.attachments && parsed.attachments.length) {
-        for (const a of parsed.attachments) {
-          if ((a.contentType || '').toLowerCase() === 'application/pdf') {
-            pdfAttachments.push({ filename: a.filename || 'attachment.pdf', bytes: Buffer.from(a.content) });
-          }
-        }
-      }
-    } else if (isMSG) {
-      // Hand off to Python helper (extract_msg)
-      const py = spawn('/opt/pyenv/bin/python', ['-u', 'msg_to_json.py'], { stdio: ['pipe', 'pipe', 'pipe'] });
-      const payload = JSON.stringify({ fileBase64 });
-      py.stdin.write(payload); py.stdin.end();
+    // Determine type
+    let ext = path.extname(filename).toLowerCase();
+    if (!ext) {
+      ext = buf.slice(0, 4).toString('ascii') === 'From' ? '.eml' : '.msg';
+    }
 
-      let out = '', err = '';
-      py.stdout.on('data', d => out += d.toString());
-      py.stderr.on('data', d => err += d.toString());
-      const code = await new Promise(resolve => py.on('close', resolve));
+    // Parse
+    let meta = { subject: '', from: '', to: '', cc: '', date: '' };
+    let bodyText = '';
 
-      if (code !== 0) {
-        return res.status(500).json({ ok: false, error: 'Python exited ' + code, stderr: err });
-      }
-      let j;
-      try { j = JSON.parse(out); } catch (e) {
-        return res.status(500).json({ ok: false, error: 'Bad JSON from python', out });
-      }
-      if (!j.ok) return res.status(422).json({ ok: false, error: j.error || 'MSG parse failed' });
+    if (ext === '.eml') {
+      const parsed = await simpleParser(buf);
+      meta.subject = parsed.subject || '';
+      meta.from    = parsed.from ? parsed.from.text : '';
+      meta.to      = parsed.to ? parsed.to.text : '';
+      meta.cc      = parsed.cc ? parsed.cc.text : '';
+      meta.date    = parsed.date ? new Date(parsed.date).toISOString() : '';
+      bodyText     = normalizeText(parsed.text || parsed.html || parsed.textAsHtml || '');
+    } else if (ext === '.msg') {
+      const tmpPath = writeTmp(buf, '.msg');
+      const out = parseMsgWithPython(tmpPath);
+      fs.unlink(tmpPath, () => {});
+      if (!out.ok) return res.status(500).json({ ok: false, error: 'msg-parse', detail: out });
 
-      const m = j.message || {};
-      cover = {
-        title: m.subject || '(no subject)',
-        headers: { From: m.from || '', To: m.to || '', Cc: m.cc || '', Date: m.date || '' },
-        bodyText: m.bodyText || ''
-      };
-      if (options.mergeAttachments && Array.isArray(m.attachments)) {
-        for (const a of m.attachments) {
-          if ((a.content_type || '').toLowerCase() === 'application/pdf' && a.base64) {
-            pdfAttachments.push({ filename: a.filename || 'attachment.pdf', bytes: Buffer.from(a.base64, 'base64') });
-          }
-        }
-      }
+      meta.subject = out.subject || '';
+      meta.from    = out.from || '';
+      meta.to      = out.to || '';
+      meta.cc      = out.cc || '';
+      meta.date    = out.date || '';
+      bodyText     = normalizeText(out.body || '');
     } else {
-      return res.status(422).json({ ok: false, error: 'Unsupported file type (use .eml or .msg)' });
+      const parsed = await simpleParser(buf);
+      meta.subject = parsed.subject || '';
+      meta.from    = parsed.from ? parsed.from.text : '';
+      meta.to      = parsed.to ? parsed.to.text : '';
+      meta.cc      = parsed.cc ? parsed.cc.text : '';
+      meta.date    = parsed.date ? new Date(parsed.date).toISOString() : '';
+      bodyText     = normalizeText(parsed.text || '');
     }
 
-    // Render the cover email to a PDF buffer
-    const coverPdf = await renderCoverPdf(cover);
+    // JSON debug if requested
+    const accept = (req.get('accept') || '').toLowerCase();
+    if (accept.includes('application/json') && !accept.includes('pdf')) {
+      return res.json({ ok: true, meta, bytes: buf.length, options });
+    }
 
-    // Merge attachments (PDF only) after the cover
-    const merged = await mergePdfs(coverPdf, pdfAttachments);
-
+    // PDF output
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `inline; filename="${safeName(filename)}.pdf"`);
-    return res.status(200).send(Buffer.from(merged));
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ ok: false, error: String(e && e.message || e) });
+    res.setHeader('Content-Disposition',
+      `inline; filename="${(path.basename(filename, ext) || 'email')}.pdf"`);
+
+    const doc = new PDFDocument({
+      autoFirstPage: true,
+      margins: { top: 54, bottom: 54, left: 54, right: 54 },
+    });
+    doc.pipe(res);
+
+    doc.font('Helvetica-Bold').fontSize(18).text('OrdoLux Email → PDF');
+    doc.moveDown(0.5);
+    doc.font('Helvetica').fontSize(10);
+    if (meta.subject) doc.text(`Subject: ${normalizeText(meta.subject)}`);
+    if (meta.from)    doc.text(`From:    ${normalizeText(meta.from)}`);
+    if (meta.to)      doc.text(`To:      ${normalizeText(meta.to)}`);
+    if (meta.cc)      doc.text(`Cc:      ${normalizeText(meta.cc)}`);
+    if (meta.date)    doc.text(`Date:    ${normalizeText(meta.date)}`);
+
+    doc.moveDown().moveTo(54, doc.y).lineTo(540, doc.y).stroke();
+    doc.moveDown();
+
+    doc.font('Helvetica').fontSize(12).text(bodyText || '(no body)', { width: 520 });
+
+    // if (options.mergeAttachments) { /* future: merge attachments */ }
+
+    doc.end();
+  } catch (err) {
+    console.error('convert error', err);
+    res.status(500).json({ ok: false, error: 'internal', detail: String(err && err.message || err) });
   }
 });
 
-app.listen(PORT, () => console.log('listening on', PORT));
-
-function safeName(n) {
-  return String(n || 'email').replace(/\.[^.]+$/, '').replace(/[^\w\-. ]+/g, '_');
-}
-function renderCoverPdf({ title, headers, bodyText }) {
-  return new Promise((resolve, reject) => {
-    const doc = new PDFDocument({ size: 'A4', margin: 40 });
-    const chunks = [];
-    doc.on('data', d => chunks.push(d));
-    doc.on('end', () => resolve(Buffer.concat(chunks)));
-    doc.on('error', reject);
-
-    doc.fontSize(18).font('Helvetica-Bold').text(title || '(no subject)');
-    doc.moveDown(0.5);
-    doc.fontSize(11).font('Helvetica');
-    const order = ['From','To','Cc','Date'];
-    order.forEach(k => {
-      const v = headers && headers[k] ? String(headers[k]) : '';
-      if (v.trim()) doc.text(`${k}: ${v}`);
-    });
-    doc.moveDown(0.5);
-    doc.moveTo(doc.x, doc.y).lineTo(555, doc.y).strokeColor('#888').stroke();
-    doc.moveDown(0.75);
-
-    const body = (bodyText || '').toString();
-    doc.fontSize(12).fillColor('#000').text(body.length ? body : '(no body)', { align: 'left' });
-
-    doc.end();
-  });
-}
-async function mergePdfs(coverPdfBuf, attachmentList) {
-  // Start with the cover
-  let outDoc = await PDFLib.load(coverPdfBuf);
-  for (const att of (attachmentList || [])) {
-    try {
-      const attDoc = await PDFLib.load(att.bytes);
-      const pages = await outDoc.copyPages(attDoc, attDoc.getPageIndices());
-      pages.forEach(p => outDoc.addPage(p));
-    } catch (e) {
-      // skip bad PDFs but continue
-      console.error('skip bad attachment', att.filename, e.message);
-    }
-  }
-  return await outDoc.save();
-}
+app.listen(PORT, () => {
+  console.log(`OrdoLux email→PDF listening on ${PORT}`);
+});
