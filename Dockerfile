@@ -1,16 +1,13 @@
 FROM node:20-slim
 
-# System deps for Python tooling
+# Python for .MSG parsing (extract_msg)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-venv python3-pip ca-certificates \
+    python3 python3-venv ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
-# Isolated Python env (avoids PEP 668 issue)
+# Create a venv and install Python libs there
 RUN python3 -m venv /opt/pyenv
-ENV PATH="/opt/pyenv/bin:${PATH}"
-
-# Python libs for MSG parsing
-RUN pip install --upgrade pip && pip install --no-cache-dir \
+RUN /opt/pyenv/bin/pip install --no-cache-dir \
     extract_msg==0.55.0 \
     olefile==0.47 \
     compressed-rtf==1.0.6 \
@@ -20,13 +17,13 @@ RUN pip install --upgrade pip && pip install --no-cache-dir \
 
 WORKDIR /app
 
-# Install Node deps first for caching
+# Install node deps (prod only)
 COPY package.json ./
 RUN npm install --omit=dev
 
 # App code
-COPY server.js ./
-COPY py/ ./py/
+COPY server.js msg_to_json.py ./
 
 ENV PORT=3000
-CMD ["node", "server.js"]
+EXPOSE 3000
+CMD ["node","server.js"]
