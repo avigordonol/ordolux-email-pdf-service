@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 # Convert a .msg file into structured JSON for Node.
-# Focus: clean addresses, prefer HTML body, surface inline CID images.
+# Uses extract_msg and prefers HTML body. Captures inline CID images.
 
 import sys, json, base64, mimetypes
-from datetime import datetime
-
-import extract_msg  # installed in the Docker image
+import extract_msg  # installed in the image
 
 if len(sys.argv) != 2:
     print(json.dumps({"error": "usage: msg_to_json.py <file.msg>"}))
@@ -43,9 +41,7 @@ try:
 except Exception:
     pass
 
-# Body: prefer HTML if present
-html = ""
-text = ""
+# Body
 try:
     html = getattr(msg, "htmlBody", "") or ""
 except Exception:
@@ -55,7 +51,7 @@ try:
 except Exception:
     text = ""
 
-# Attachments (inline images and others)
+# Attachments
 atts = []
 for a in getattr(msg, "attachments", []):
     try:
