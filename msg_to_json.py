@@ -1,61 +1,49 @@
 #!/usr/bin/env python3
 import sys, json, base64, datetime
+from extract_msg import Message
 
 def b64(x: bytes) -> str:
     return base64.b64encode(x).decode('ascii')
 
-def to_iso(dt):
+def iso(dt):
+    if not dt:
+        return None
     if isinstance(dt, datetime.datetime):
         if dt.tzinfo is None:
-            return dt.isoformat() + "Z"
-        return dt.isoformat()
-    return None
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.astimezone(datetime.timezone.utc).isoformat()
+    return str(dt)
 
 def main():
     if len(sys.argv) < 2:
-        print(json.dumps({"ok": False, "error": "usage: msg_to_json.py PATH.msg"}))
+        print(json.dumps({"ok": False, "error": "no input path"}))
         return
-
     path = sys.argv[1]
-
     try:
-        import extract_msg
-    except Exception as e:
-        print(json.dumps({"ok": False, "error": f"extract_msg import failed: {e}"}))
-        return
+        msg = Message(path)
+        msg_sender = (msg.sender or msg.header.get('From') or "").strip()
+        msg_to     = (msg.to or msg.header.get('To') or "").strip()
+        msg_cc     = (msg.cc or msg.header.get('Cc') or "").strip()
+        subject    = (msg.subject or "").strip()
+        date_iso   = iso(msg.date)
 
-    try:
-        msg = extract_msg.Message(path)
-        msg_sender = (msg.sender or "").replace("\t", " ")
-        msg_to = (msg.to or "").replace("\t", " ")
-        msg_cc = (getattr(msg, 'cc', '') or "").replace("\t", " ")
-        subject = (msg.subject or "").replace("\t", " ")
-        date_iso = to_iso(getattr(msg, 'date', None))
-
-        body_html = getattr(msg, 'htmlBody', None)
-        body_text = getattr(msg, 'body', None)
+        body_html  = msg.htmlBody if msg.htmlBody else None
+        body_text  = msg.body if msg.body else None
 
         atts = []
         for a in msg.attachments:
-            # Try a bunch of common fields for CID & name/type
-            cid = None
-            for cand in ('cid', 'content_id', 'contentId', 'pidContentId', 'pid_content_id'):
-                cid = cid or getattr(a, cand, None)
-            filename = getattr(a, 'longFilename', None) or getattr(a, 'shortFilename', None) or getattr(a, 'filename', None)
-            content_type = getattr(a, 'mimetype', None) or getattr(a, 'mimeType', None) or "application/octet-stream"
-            data = a.data if hasattr(a, 'data') else None
-            if data is None:
-                # Some versions expose ._data
-                data = getattr(a, '_data', None)
-            if data is None:
-                continue
-
+            data = None
+            try:
+                data = a.data
+            except Exception:
+                data = None
             atts.append({
-                "filename": filename or "attachment",
-                "contentType": content_type,
-                "contentId": (cid or "").strip().strip("<>"),
-                "isInline": bool(cid),
-                "dataB64": b64(data),
+                "filename": a.longFilename or a.shortFilename or "attachment",
+                "contentType": a.mimeType or "application/octet-stream",
+                # extract_msg rarely exposes CID; keep empty unless present
+                "contentId": (getattr(a, "cid", None) or getattr(a, "content_id", None) or "") or "",
+                "isInline": bool(getattr(a, "cid", None) or getattr(a, "content_id", None)),
+                "dataB64": b64(data) if isinstance(data, (bytes, bytearray)) else None
             })
 
         out = {
@@ -63,7 +51,7 @@ def main():
             "meta": {
                 "source": "msg",
                 "has_html": bool(body_html),
-                "attachment_count": len(atts),
+                "attachment_count": len(atts)
             },
             "message": {
                 "from": msg_sender,
@@ -76,7 +64,7 @@ def main():
                 "attachments": atts
             }
         }
-        print(json.dumps(out))
+        print(json.dumps(out, ensure_ascii=False))
     except Exception as e:
         print(json.dumps({"ok": False, "error": str(e)}))
 
