@@ -1,67 +1,91 @@
-#!/usr/bin/env /opt/pyenv/bin/python
-import base64, json, sys, tempfile, os
-import extract_msg
+#!/usr/bin/env python3
+# Convert a .msg file into structured JSON for Node.
+# Focus: clean addresses, prefer HTML body, surface inline CID images.
 
-def to_str(v):
-    if v is None:
-        return ""
-    if isinstance(v, bytes):
-        try:
-            return v.decode("utf-8", errors="replace")
-        except:
-            return v.decode("latin1", errors="replace")
-    return str(v)
+import sys, json, base64, mimetypes
+from datetime import datetime
 
-def main():
-    data = sys.stdin.read()
-    j = json.loads(data)
+import extract_msg  # installed in the Docker image
 
-    b64 = j.get("fileBase64") or j.get("content_base64") or ""
-    raw = base64.b64decode(b64)
-    # Write to temp file for extract_msg
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".msg") as f:
-        f.write(raw)
-        path = f.name
+if len(sys.argv) != 2:
+    print(json.dumps({"error": "usage: msg_to_json.py <file.msg>"}))
+    sys.exit(1)
 
+fn = sys.argv[1]
+msg = extract_msg.Message(fn)
+
+def recipients_by(kind_upper):
+    out = []
     try:
-        msg = extract_msg.Message(path)
-        msg_message = {
-            "subject": to_str(getattr(msg, "subject", "")),
-            "from": to_str(getattr(msg, "sender", "")) or to_str(getattr(msg, "from_", "")),
-            "to": to_str(getattr(msg, "to", "")),
-            "cc": to_str(getattr(msg, "cc", "")),
-            "date": to_str(getattr(msg, "date", "")),
-            "bodyText": to_str(getattr(msg, "body", "")),
-            "attachments": []
-        }
+        for r in getattr(msg, "recipients", []):
+            typ = (getattr(r, "type", "") or "").strip().upper()
+            if typ == kind_upper:
+                name = getattr(r, "name", "") or getattr(r, "display_name", "") or ""
+                addr = (
+                    getattr(r, "email", "")
+                    or getattr(r, "email_address", "")
+                    or getattr(r, "smtp_address", "")
+                    or getattr(r, "address", "")
+                    or ""
+                )
+                out.append({"name": name, "address": addr})
+    except Exception:
+        pass
+    return out
 
-        # Collect only PDF attachments (as base64)
-        atts = getattr(msg, "attachments", []) or []
-        for a in atts:
-            try:
-                name = to_str(getattr(a, "longFilename", "")) or to_str(getattr(a, "shortFilename", "")) or "attachment"
-                content = a.data
-                if not content:
-                    continue
-                lname = name.lower()
-                if lname.endswith(".pdf"):
-                    msg_message["attachments"].append({
-                        "filename": name,
-                        "content_type": "application/pdf",
-                        "base64": base64.b64encode(content).decode("ascii")
-                    })
-            except Exception as e:
-                # skip broken attachment but keep going
-                continue
+# Sender
+from_list = []
+try:
+    from_list = [{
+        "name": getattr(msg, "sender", "") or "",
+        "address": getattr(msg, "sender_email", "") or getattr(msg, "sender_email_address", "") or ""
+    }]
+except Exception:
+    pass
 
-        print(json.dumps({"ok": True, "message": msg_message}))
-    except Exception as e:
-        print(json.dumps({"ok": False, "error": str(e)}))
-    finally:
+# Body: prefer HTML if present
+html = ""
+text = ""
+try:
+    html = getattr(msg, "htmlBody", "") or ""
+except Exception:
+    html = ""
+try:
+    text = getattr(msg, "body", "") or ""
+except Exception:
+    text = ""
+
+# Attachments (inline images and others)
+atts = []
+for a in getattr(msg, "attachments", []):
+    try:
+        data = a.data
+    except Exception:
         try:
-            os.unlink(path)
-        except:
-            pass
+            data = a._data
+        except Exception:
+            data = b""
+    cid = getattr(a, "contentId", None) or getattr(a, "cid", None) or ""
+    fname = getattr(a, "longFilename", None) or getattr(a, "shortFilename", None) or "attachment"
+    ctype = getattr(a, "mimeType", None) or mimetypes.guess_type(fname)[0] or "application/octet-stream"
+    inline = bool(cid)
+    atts.append({
+        "filename": fname,
+        "contentType": ctype,
+        "contentId": str(cid) if cid else "",
+        "inline": inline,
+        "data": base64.b64encode(data).decode("ascii")
+    })
 
-if __name__ == "__main__":
-    main()
+out = {
+    "subject": getattr(msg, "subject", "") or "",
+    "date": getattr(msg, "date", "") or "",
+    "from": from_list,
+    "to": recipients_by("TO"),
+    "cc": recipients_by("CC"),
+    "html": html,
+    "text": text,
+    "attachments": atts
+}
+
+print(json.dumps(out))
