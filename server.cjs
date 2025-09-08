@@ -1,323 +1,351 @@
-// OrdoLux Email→PDF – stable PDFKit build with diagnostics
-const express = require('express');
+/* OrdoLux Email→PDF server — v1.4.0
+   - Robust /convert-json that always returns JSON
+   - Unicode-safe rendering via DejaVuSans
+   - Strips zero-width/odd spaces
+   - Scales images nicely
+*/
 const fs = require('fs');
-const fsp = require('fs/promises');
 const os = require('os');
 const path = require('path');
 const { execFile } = require('child_process');
+const express = require('express');
+const bodyParser = require('body-parser');
 const { simpleParser } = require('mailparser');
-const he = require('he');
-const PDFDocument = require('pdfkit');
-const pkg = require('./package.json');
+const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
+const fontkit = require('@pdf-lib/fontkit');
+const { htmlToText } = require('html-to-text');
 
-const PORT = process.env.PORT || 8080;
-const SECRET = process.env.ORDOLUX_SECRET || null;
-const PY = '/opt/pyenv/bin/python3';
-const PY_SCRIPT = path.join(__dirname, 'msg_to_json.py');
-const FONT_PATH = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
+const SECRET_HEADER = 'x-ordolux-secret';
+const EXPECTED_SECRET = process.env.ORDOLUX_SECRET || ''; // Railway variable recommended
 
 const app = express();
+app.use(bodyParser.json({ limit: '25mb' }));
 
-// JSON body parser with explicit error handler
-app.use(express.json({ limit: '100mb' }));
-app.use((err, req, res, next) => {
-  if (err && err.type === 'entity.too.large') {
-    return res.status(413).json({ ok: false, error: 'payload too large' });
-  }
-  if (err instanceof SyntaxError) {
-    return res.status(400).json({ ok: false, error: 'invalid JSON body' });
-  }
-  next();
-});
+// --- helpers ----
+const INVISIBLES_RX = /[\u200B\u200C\u200D\uFEFF\u2060\u00AD]/g; // zero width + soft hyphen
+const NBSP_RX = /\u00A0/g;
 
-function auth(req, res) {
-  if (!SECRET) return true;
-  const got = req.header('x-ordolux-secret');
-  if (got === SECRET) return true;
-  res.status(401).json({ ok: false, error: 'unauthorized' });
-  return false;
+function sanitizeString(s) {
+  if (!s) return '';
+  return String(s)
+    .replace(NBSP_RX, ' ')
+    .replace(INVISIBLES_RX, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\u2028|\u2029/g, '\n');
 }
 
-// --- diagnostics ---
-app.get('/healthz', (req, res) => {
-  res.json({
-    ok: true,
-    name: 'ordolux-email-pdf',
-    version: pkg.version || 'unknown',
-    ts: new Date().toISOString()
-  });
-});
-app.get('/routes', (req, res) => {
-  if (!auth(req, res)) return;
-  res.json({
-    ok: true,
-    routes: [
-      'GET  /healthz',
-      'GET  /routes',
-      'POST /echo',
-      'POST /convert-json',
-      'POST /convert'
-    ],
-    expects_header: 'X-Ordolux-Secret'
-  });
-});
-app.post('/echo', (req, res) => {
-  if (!auth(req, res)) return;
-  res.json({
-    ok: true,
-    keys: Object.keys(req.body || {}),
-    has_fileBase64: !!(req.body && req.body.fileBase64),
-    filename: req.body && req.body.filename,
-    options: req.body && req.body.options
-  });
-});
-
-// ---------- helpers ----------
-function cleanHeader(s) {
-  return (s || '').replace(/\t+/g, ' ').replace(/\s{2,}/g, ' ').trim();
-}
-function normalizeCid(s) {
-  return (s || '').replace(/[<>\s]/g, '').toLowerCase();
-}
-function stripTags(html) {
-  return (html || '')
-    .replace(/<!--[\s\S]*?-->/g, '')
-    .replace(/<style[\s\S]*?<\/style>/gi, '')
-    .replace(/<head[\s\S]*?<\/head>/gi, '')
-    .replace(/<o:[\s\S]*?<\/o:[^>]+>/gi, '')
-    .replace(/<w:[\s\S]*?<\/w:[^>]+>/gi, '')
-    .replace(/<\/?([a-zA-Z0-9]+)(\s[^>]*)?>/g, ' ');
-}
-function splitHtmlToTokens(html) {
-  let h = html || '';
-  // Outlook cruft + line handling
-  h = h.replace(/\u200B/g, '');       // zero-width space
-  h = h.replace(/\u00A0/g, ' ');      // nbsp → space
-  h = h.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-  h = h.replace(/<br\s*\/?>/gi, '\n');
-  h = h.replace(/<\/p>/gi, '\n\n');
-
-  const tokens = [];
-  const rx = /<img[^>]+src=["']cid:([^"']+)["'][^>]*>/ig;
-  let last = 0, m;
-  while ((m = rx.exec(h)) !== null) {
-    const pre = h.slice(last, m.index);
-    const txt = he.decode(stripTags(pre))
-      .replace(/[ \t]+\n/g, '\n')
-      .replace(/[ \t]{2,}/g, ' ')
-      .trim();
-    if (txt) tokens.push({ type: 'text', text: txt });
-    tokens.push({ type: 'img', cid: normalizeCid(m[1]) });
-    last = rx.lastIndex;
-  }
-  const tail = h.slice(last);
-  const tailTxt = he.decode(stripTags(tail))
-    .replace(/[ \t]+\n/g, '\n')
-    .replace(/[ \t]{2,}/g, ' ')
-    .trim();
-  if (tailTxt) tokens.push({ type: 'text', text: tailTxt });
-
-  return tokens.length ? tokens : [{ type: 'text', text: he.decode(stripTags(html || '')) }];
+function mustAuth(req, res) {
+  if (!EXPECTED_SECRET) return true; // dev mode
+  return (req.headers[SECRET_HEADER] || '') === EXPECTED_SECRET;
 }
 
-async function parseMSG(tmpPath) {
-  const out = await new Promise((resolve, reject) => {
-    execFile(PY, [PY_SCRIPT, tmpPath], { timeout: 30000 }, (err, stdout, stderr) => {
-      if (err) return reject(new Error(`msg_to_json failed: ${err.message}`));
-      try { resolve(JSON.parse(stdout.toString('utf8'))); }
-      catch (e) { reject(new Error(`msg_to_json bad JSON: ${e.message}`)); }
-    });
-  });
-  if (!out || !out.ok) throw new Error(out && out.error ? out.error : 'msg parse failed');
-
-  const m = out.message || {};
-  const a = Array.isArray(m.attachments) ? m.attachments : [];
+function toTinySummary(parsed) {
+  const m = parsed.message || {};
+  const a = m.attachments || [];
   return {
-    from: cleanHeader(m.from),
-    to: cleanHeader(m.to),
-    cc: cleanHeader(m.cc),
-    subject: cleanHeader(m.subject),
-    date: m.date || null,
-    html: m.body_html || null,
-    text: m.body_text || null,
-    attachments: a.map(x => ({
-      filename: x.filename || 'attachment',
-      contentType: x.contentType || 'application/octet-stream',
-      contentId: normalizeCid(x.contentId || ''),
-      isInline: !!x.isInline,
-      dataB64: x.dataB64 || null
-    }))
-  };
-}
-
-async function parseEML(buffer) {
-  const mail = await simpleParser(buffer);
-  const addrStr = (addr) => {
-    if (!addr) return '';
-    if (typeof addr === 'string') return cleanHeader(addr);
-    if (addr.value && Array.isArray(addr.value)) {
-      return addr.value.map(v => v.name ? `${v.name} <${v.address}>` : v.address).join(', ');
-    }
-    return cleanHeader(String(addr));
-  };
-  const atts = (mail.attachments || []).map(a => ({
-    filename: a.filename || 'attachment',
-    contentType: a.contentType || 'application/octet-stream',
-    contentId: normalizeCid(a.cid || a.contentId || ''),
-    isInline: !!(a.cid || a.contentId),
-    dataB64: a.content ? Buffer.from(a.content).toString('base64') : null
-  }));
-  return {
-    from: addrStr(mail.from),
-    to: addrStr(mail.to),
-    cc: addrStr(mail.cc),
-    subject: cleanHeader(mail.subject || ''),
-    date: mail.date ? new Date(mail.date).toISOString() : null,
-    html: mail.html || null,
-    text: mail.text || null,
-    attachments: atts
-  };
-}
-
-async function parseUploaded(filename, fileB64) {
-  const lower = (filename || '').toLowerCase();
-  const bin = Buffer.from(fileB64, 'base64');
-  if (lower.endsWith('.eml')) return await parseEML(bin);
-
-  const tmp = path.join(os.tmpdir(), `upl-${Date.now()}-${Math.random().toString(36).slice(2)}.msg`);
-  await fsp.writeFile(tmp, bin);
-  try { return await parseMSG(tmp); }
-  finally { try { await fsp.unlink(tmp); } catch {} }
-}
-
-function newDoc() {
-  const doc = new PDFDocument({
-    size: 'A4',
-    margins: { top: 54, left: 54, right: 54, bottom: 54 }
-  });
-  doc.registerFont('Body', FONT_PATH);
-  doc.font('Body').fontSize(11);
-  return doc;
-}
-function width(doc) { return doc.page.width - doc.page.margins.left - doc.page.margins.right; }
-function ensureSpace(doc, needed) {
-  const bottom = doc.page.height - doc.page.margins.bottom;
-  if (doc.y + needed > bottom) doc.addPage();
-}
-function hr(doc) {
-  const x1 = doc.page.margins.left;
-  const x2 = doc.page.width - doc.page.margins.right;
-  doc.moveTo(x1, doc.y).lineTo(x2, doc.y).strokeColor('#999').lineWidth(0.5).stroke();
-  doc.moveDown(0.8);
-}
-function drawKV(doc, k, v) {
-  if (!v) return;
-  doc.font('Body').fontSize(11).text(`${k}: ${v}`, { width: width(doc) });
-}
-function drawImage(doc, buf) {
-  const maxW = width(doc);
-  const maxH = 420; // constrain tall images
-  ensureSpace(doc, 50);
-  try { doc.image(buf, { fit: [maxW, maxH], align: 'left' }); } catch {}
-  doc.moveDown(0.5);
-}
-
-async function renderPdf(parsed, mergeAttachments) {
-  const doc = newDoc();
-
-  // Header (no branding)
-  drawKV(doc, 'Subject', parsed.subject);
-  drawKV(doc, 'From', parsed.from);
-  drawKV(doc, 'To', parsed.to);
-  drawKV(doc, 'Cc', parsed.cc);
-  drawKV(doc, 'Date', parsed.date);
-  doc.moveDown(0.6);
-  hr(doc);
-
-  // cid map for inline images
-  const cidMap = new Map();
-  (parsed.attachments || []).forEach(a => {
-    if (a.dataB64 && a.contentId) cidMap.set(a.contentId, Buffer.from(a.dataB64, 'base64'));
-  });
-
-  // tokens
-  const tokens = parsed.html ? splitHtmlToTokens(parsed.html)
-                             : [{ type: 'text', text: parsed.text || '' }];
-
-  for (const t of tokens) {
-    if (t.type === 'text') {
-      const s = (t.text || '').replace(/\u200B/g, '').replace(/\u00A0/g, ' ').replace(/\r/g, '').trim();
-      if (s) { doc.text(s, { width: width(doc) }); doc.moveDown(0.6); }
-    } else if (t.type === 'img') {
-      const buf = cidMap.get(normalizeCid(t.cid));
-      if (buf) drawImage(doc, buf);
-    }
-  }
-
-  // Append remaining image attachments if requested
-  if (mergeAttachments) {
-    const used = new Set(tokens.filter(x => x.type === 'img').map(x => normalizeCid(x.cid)));
-    for (const a of parsed.attachments || []) {
-      const isImage = (a.contentType || '').startsWith('image/');
-      const cid = normalizeCid(a.contentId);
-      if (isImage && a.dataB64 && (!cid || !used.has(cid))) {
-        drawImage(doc, Buffer.from(a.dataB64, 'base64'));
+    ok: true,
+    parsed: {
+      meta: parsed.meta || {},
+      message: {
+        from: m.from || '',
+        to: m.to || '',
+        cc: m.cc || '',
+        subject: m.subject || '',
+        date: m.date || '',
+        text_length: (m.text || '').length,
+        html_length: (m.html || '').length,
+        attach_count: a.length
       }
     }
-  }
+  };
+}
 
-  const chunks = [];
-  return await new Promise((resolve, reject) => {
-    doc.on('data', d => chunks.push(d));
-    doc.on('end', () => resolve(Buffer.concat(chunks)));
-    doc.on('error', reject);
-    doc.end();
+async function runPyMsgToJson(tmpPath) {
+  const py = '/opt/pyenv/bin/python3';
+  const script = path.join(__dirname, 'msg_to_json.py');
+  return new Promise((resolve, reject) => {
+    execFile(py, [script, tmpPath], { maxBuffer: 25 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) return reject(new Error(stderr || err.message));
+      try {
+        const obj = JSON.parse(stdout);
+        resolve(obj);
+      } catch (e) {
+        reject(new Error(`.msg parse JSON error: ${e.message}`));
+      }
+    });
   });
 }
 
-// ---------- routes ----------
-app.post('/convert-json', async (req, res) => {
-  if (!auth(req, res)) return;
-  try {
-    const { fileBase64, filename } = req.body || {};
-    if (!fileBase64 || !filename) return res.status(422).json({ ok: false, error: 'missing fileBase64 or filename' });
+function normalizeAddrs(addrs) {
+  // addrs can be AddressObject or string; keep it simple for PDF header
+  if (!addrs) return '';
+  if (typeof addrs === 'string') return sanitizeString(addrs);
+  const arr = [];
+  const list = [].concat(addrs.value || []);
+  for (const a of list) {
+    const n = sanitizeString(a.name || '');
+    const a1 = sanitizeString(a.address || '');
+    if (n && a1) arr.push(`${n} <${a1}>`);
+    else if (a1) arr.push(a1);
+    else if (n) arr.push(n);
+  }
+  return arr.join(', ');
+}
 
-    const parsed = await parseUploaded(filename, fileBase64);
-    return res.json({
-      ok: true,
-      parsed: {
-        message: {
-          from: parsed.from, to: parsed.to, cc: parsed.cc,
-          subject: parsed.subject, date: parsed.date,
-          text_length: (parsed.text || '').length,
-          html_length: (parsed.html || '').length,
-          attach_count: (parsed.attachments || []).length
+async function parseEmailFromUpload(fileBase64, filename) {
+  const buf = Buffer.from(fileBase64, 'base64');
+  const lower = (filename || '').toLowerCase();
+
+  if (lower.endsWith('.eml')) {
+    const mail = await simpleParser(buf);
+    const attachments = (mail.attachments || []).map(att => ({
+      filename: att.filename || '',
+      contentType: att.contentType || '',
+      contentId: (att.cid || '').replace(/[<>]/g, '').toLowerCase(),
+      inline: !!att.cid,
+      dataBase64: (att.content ? Buffer.from(att.content).toString('base64') : '')
+    }));
+    return {
+      meta: { source: 'eml', has_html: !!mail.html, attachment_count: attachments.length },
+      message: {
+        from: normalizeAddrs(mail.from),
+        to: normalizeAddrs(mail.to),
+        cc: normalizeAddrs(mail.cc),
+        subject: sanitizeString(mail.subject),
+        date: mail.date ? new Date(mail.date).toISOString() : '',
+        text: sanitizeString(mail.text || ''),
+        html: sanitizeString(typeof mail.html === 'string' ? mail.html : ''),
+        attachments
+      }
+    };
+  }
+
+  // Fallback: assume .msg — write temp file then call Python
+  const tmp = path.join(os.tmpdir(), `upl-${Date.now()}-${Math.random().toString(36).slice(2)}.msg`);
+  fs.writeFileSync(tmp, buf);
+  try {
+    const obj = await runPyMsgToJson(tmp);
+    // attachments already base64 in obj
+    const attachments = (obj.attachments || []).map(att => ({
+      filename: att.filename || '',
+      contentType: att.contentType || '',
+      contentId: (att.contentId || '').replace(/[<>]/g, '').toLowerCase(),
+      inline: !!att.inline,
+      dataBase64: att.dataBase64 || ''
+    }));
+    return {
+      meta: { source: 'msg', has_html: !!obj.html, attachment_count: attachments.length },
+      message: {
+        from: sanitizeString(obj.from || ''),
+        to: sanitizeString(obj.to || ''),
+        cc: sanitizeString(obj.cc || ''),
+        subject: sanitizeString(obj.subject || ''),
+        date: obj.date || '',
+        text: sanitizeString(obj.text || ''),
+        html: sanitizeString(obj.html || ''),
+        attachments
+      }
+    };
+  } finally {
+    try { fs.unlinkSync(tmp); } catch {}
+  }
+}
+
+function htmlToPlain(s) {
+  if (!s) return '';
+  const text = htmlToText(s, {
+    wordwrap: false,
+    selectors: [
+      { selector: 'a', options: { hideLinkHrefIfSameAsText: true } },
+      { selector: 'img', format: 'skip' } // we render images separately
+    ]
+  });
+  return sanitizeString(text);
+}
+
+function collectCidOrderFromHtml(html) {
+  if (!html) return [];
+  const rx = /<img[^>]+src=['"]cid:([^'">]+)['"][^>]*>/ig;
+  const order = [];
+  let m;
+  while ((m = rx.exec(html))) {
+    order.push(m[1].replace(/[<>]/g, '').toLowerCase());
+  }
+  return order;
+}
+
+async function renderPdf(parsed) {
+  const { message } = parsed;
+  const doc = await PDFDocument.create();
+  doc.registerFontkit(fontkit);
+
+  // Use DejaVu Sans (installed by Dockerfile)
+  const fontBytes = fs.readFileSync('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf');
+  const font = await doc.embedFont(fontBytes, { subset: true });
+
+  const pageWidth = 595.28;   // A4
+  const pageHeight = 841.89;
+  const margin = 48;
+  const usableW = pageWidth - margin * 2;
+  const lineGap = 4;
+  const fontSize = 10;
+
+  let page = doc.addPage([pageWidth, pageHeight]);
+  let cursorY = pageHeight - margin;
+
+  const setColor = rgb(0, 0, 0);
+
+  function newPage(hMin = 0) {
+    page = doc.addPage([pageWidth, pageHeight]);
+    cursorY = pageHeight - margin;
+  }
+  function ensureSpace(h) {
+    if (cursorY - h < margin) newPage();
+  }
+  function drawTextBlock(txt) {
+    if (!txt) return;
+    const lines = wrapText(txt, usableW, font, fontSize);
+    for (const ln of lines) {
+      const height = fontSize;
+      ensureSpace(height);
+      page.drawText(ln, { x: margin, y: cursorY - height, size: fontSize, font, color: setColor });
+      cursorY -= (height + lineGap);
+    }
+  }
+  // Simple word-wrapping using font width
+  function wrapText(text, maxWidth, font, size) {
+    const words = text.split(/\s+/);
+    const lines = [];
+    let line = '';
+    for (const w of words) {
+      const trial = line ? line + ' ' + w : w;
+      const width = font.widthOfTextAtSize(trial, size);
+      if (width <= maxWidth) {
+        line = trial;
+      } else {
+        if (line) lines.push(line);
+        // very long single "word" fallback
+        if (font.widthOfTextAtSize(w, size) > maxWidth) {
+          let buf = '';
+          for (const ch of w) {
+            const t2 = buf + ch;
+            if (font.widthOfTextAtSize(t2, size) <= maxWidth) buf = t2;
+            else { lines.push(buf); buf = ch; }
+          }
+          line = buf;
+        } else {
+          line = w;
         }
       }
-    });
+    }
+    if (line) lines.push(line);
+    return lines;
+  }
+
+  // Header (no OrdoLux logo/mark, per request)
+  const header = [
+    `From: ${sanitizeString(message.from || '')}`,
+    `To: ${sanitizeString(message.to || '')}`,
+    message.cc ? `Cc: ${sanitizeString(message.cc)}` : '',
+    message.date ? `Date: ${sanitizeString(message.date)}` : '',
+    `Subject: ${sanitizeString(message.subject || '')}`
+  ].filter(Boolean).join('\n');
+
+  drawTextBlock(header);
+  cursorY -= 8;
+
+  // Body text (prefer HTML → text)
+  const bodyText = message.html ? htmlToPlain(message.html) : sanitizeString(message.text || '');
+  drawTextBlock(bodyText);
+
+  // Inline images (by CID order in HTML); if none, embed all image attachments at end
+  const att = Array.isArray(message.attachments) ? message.attachments : [];
+  const images = att.filter(a => (a.contentType || '').toLowerCase().startsWith('image/') && a.dataBase64);
+
+  const cidOrder = collectCidOrderFromHtml(message.html || '');
+  const cidMap = new Map();
+  for (const a of images) cidMap.set((a.contentId || '').toLowerCase(), a);
+  const ordered = [];
+  for (const id of cidOrder) {
+    const it = cidMap.get(id);
+    if (it) { ordered.push(it); cidMap.delete(id); }
+  }
+  for (const a of images) {
+    if (cidMap.has((a.contentId || '').toLowerCase())) ordered.push(a);
+  }
+
+  for (const img of ordered) {
+    const bytes = Buffer.from(img.dataBase64, 'base64');
+    let embedded;
+    try {
+      // pdf-lib auto-detects
+      embedded = await doc.embedPng(bytes).catch(async () => await doc.embedJpg(bytes));
+    } catch {
+      continue; // skip bad image
+    }
+    const maxW = usableW;
+    const maxH = 420; // sensible cap
+    let w = embedded.width;
+    let h = embedded.height;
+    const scale = Math.min(maxW / w, maxH / h, 1);
+    w = w * scale; h = h * scale;
+
+    ensureSpace(h + 16);
+    page.drawImage(embedded, { x: margin, y: cursorY - h, width: w, height: h });
+    cursorY -= (h + 12);
+    if (img.filename) {
+      page.drawText(sanitizeString(img.filename), { x: margin, y: cursorY - fontSize, size: fontSize, font, color: rgb(0.3,0.3,0.3) });
+      cursorY -= (fontSize + 8);
+    }
+  }
+
+  return await doc.save();
+}
+
+// ---- routes ----
+app.get('/healthz', (_req, res) => {
+  res.json({ ok: true, name: 'ordolux-email-pdf', version: '1.4.0', ts: new Date().toISOString() });
+});
+
+app.get('/routes', (req, res) => {
+  if (!mustAuth(req, res)) return res.status(401).json({ ok:false, error: 'unauthorized', expects: SECRET_HEADER });
+  res.json({ ok: true, routes: ['GET  /healthz','GET  /routes','POST /echo','POST /convert-json','POST /convert'], expects_header: 'X-Ordolux-Secret' });
+});
+
+app.post('/echo', (req, res) => {
+  if (!mustAuth(req, res)) return res.status(401).json({ ok:false, error: 'unauthorized' });
+  const b = req.body || {};
+  res.json({ ok: true, keys: Object.keys(b), has_fileBase64: !!b.fileBase64 });
+});
+
+app.post('/convert-json', async (req, res) => {
+  if (!mustAuth(req, res)) return res.status(401).json({ ok:false, error:'unauthorized' });
+  try {
+    const { fileBase64, filename } = req.body || {};
+    if (!fileBase64 || !filename) return res.status(400).json({ ok:false, error: 'missing fileBase64/filename' });
+    const parsed = await parseEmailFromUpload(fileBase64, filename);
+    return res.json(toTinySummary(parsed));
   } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e) });
+    return res.status(200).json({ ok:false, error: String(e && e.message || e) });
   }
 });
 
 app.post('/convert', async (req, res) => {
-  if (!auth(req, res)) return;
+  if (!mustAuth(req, res)) return res.status(401).json({ ok:false, error:'unauthorized' });
   try {
-    const { fileBase64, filename, options } = req.body || {};
-    if (!fileBase64 || !filename) return res.status(422).json({ ok: false, error: 'missing fileBase64 or filename' });
+    const { fileBase64, filename } = req.body || {};
+    if (!fileBase64 || !filename) return res.status(400).json({ ok:false, error: 'missing fileBase64/filename' });
 
-    const mergeAttachments = !!(options && options.mergeAttachments);
-    const parsed = await parseUploaded(filename, fileBase64);
-    const pdf = await renderPdf(parsed, mergeAttachments);
+    const parsed = await parseEmailFromUpload(fileBase64, filename);
+    const pdfBytes = await renderPdf(parsed);
 
-    res.set('Content-Type', 'application/pdf');
-    res.set('Content-Disposition', `attachment; filename="${path.basename(filename, path.extname(filename))}.pdf"`);
-    return res.send(pdf);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.send(Buffer.from(pdfBytes));
   } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e) });
+    // Still send JSON so your script can show something useful
+    res.status(500).json({ ok:false, error: String(e && e.message || e) });
   }
 });
 
-app.use((req, res) => res.status(404).json({ ok: false, error: 'not found' }));
-
-app.listen(PORT, () => console.log(`OrdoLux email→pdf ${pkg.version} listening on :${PORT}`));
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log(`OrdoLux Email→PDF listening on ${PORT}`));
