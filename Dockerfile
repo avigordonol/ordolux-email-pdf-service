@@ -1,36 +1,32 @@
-# ---- OrdoLux Email→PDF service (Node + Python) ----
+# Use Node 20 slim
 FROM node:20-slim
 
-# OS packages: Python (for .msg parsing), fonts for PDF text, certs
+# System deps (Python + fonts for PDF engines, certs)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-venv python3-pip \
     fonts-dejavu-core \
     ca-certificates \
-  && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/*
 
-# Create isolated Python env (avoids PEP 668 issues) and ensure it's first in PATH
+# Python venv (optional but keeps things tidy)
 RUN python3 -m venv /opt/pyenv
 ENV PATH="/opt/pyenv/bin:${PATH}"
+ENV PYTHON=/opt/pyenv/bin/python3
 
-# Python deps used by msg_to_json.py (pin versions for reproducibility)
-RUN pip install --no-cache-dir \
-    extract-msg==0.41.2 \
-    olefile==0.47 \
-    compressed-rtf==1.0.6 \
-    chardet==5.2.0
+# Python deps used for MSG→EML
+# NOTE: extract-msg 0.41.2 depends on olefile==0.46 (not 0.47)
+RUN pip install --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir \
+      extract-msg==0.41.2 \
+      olefile==0.46 \
+      compressed-rtf==1.0.6 \
+      chardet==5.2.0
 
-# App directory
+# App
 WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev
+COPY . .
 
-# Install Node deps first for better layer caching
-COPY package.json ./
-ENV NODE_ENV=production
-RUN npm install --omit=dev
-
-# App code
-COPY server.cjs msg_to_json.py ./
-COPY py/ ./py/
-
-# Runtime config
-EXPOSE 8080
+EXPOSE 3000
 CMD ["node", "server.cjs"]
