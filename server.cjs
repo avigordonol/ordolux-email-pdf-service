@@ -1,4 +1,3 @@
-// server.cjs
 "use strict";
 
 const express = require("express");
@@ -6,14 +5,13 @@ const bodyParser = require("body-parser");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { spawn, execFile } = require("child_process");
+const { spawn } = require("child_process");
 const puppeteer = require("puppeteer-core");
 
 const app = express();
 app.use(bodyParser.json({ limit: "25mb" }));
 
-// --- config / auth --------------------------------------------------------
-
+// -------------------- auth --------------------
 const SECRET =
   process.env.ORDOLUX_CONVERTER_SECRET ||
   process.env.CONVERTER_SECRET ||
@@ -28,17 +26,7 @@ function requireAuth(req, res) {
   return true;
 }
 
-// --- small helpers --------------------------------------------------------
-
-function execFileP(cmd, args, opts = {}) {
-  return new Promise((resolve, reject) => {
-    execFile(cmd, args, opts, (err, stdout, stderr) => {
-      if (err) return reject(new Error((stderr && String(stderr)) || err.message));
-      resolve({ stdout, stderr });
-    });
-  });
-}
-
+// -------------------- helpers --------------------
 function runPythonStdIn(scriptPath, stdinBuffer) {
   return new Promise((resolve, reject) => {
     const py = spawn(process.env.PYTHON || "python3", [scriptPath]);
@@ -56,147 +44,191 @@ function runPythonStdIn(scriptPath, stdinBuffer) {
 }
 
 function escapeHtml(s = "") {
-  return String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
-
 function stripAngle(s = "") {
   return String(s).replace(/^<|>$/g, "");
 }
-
 function detectChromium() {
-  const candidates = [
+  const cands = [
     process.env.CHROMIUM_PATH,
     "/usr/bin/chromium",
     "/usr/bin/chromium-browser",
     "/usr/bin/google-chrome",
     "/usr/bin/google-chrome-stable",
   ].filter(Boolean);
-  for (const p of candidates) {
-    try {
-      if (fs.existsSync(p)) return p;
-    } catch (_) {}
+  for (const p of cands) {
+    try { if (fs.existsSync(p)) return p; } catch {}
   }
-  throw new Error("Chromium not found. Ensure 'chromium' is installed and set CHROMIUM_PATH if needed.");
+  throw new Error("Chromium not found. Install chromium and/or set CHROMIUM_PATH.");
 }
 
-/**
- * Trim email HTML:
- * - remove leading empty blocks / &nbsp; spacers / long <br> runs
- * (do not strip tiny images; some signatures legitimately use tiny logos)
- */
+// Trim obvious leading blanks in raw HTML string
 function normalizeEmailHtml(s) {
   if (!s) return "";
-  // Trim leading blank blocks (nbsp paragraphs, empty divs, many <br/>)
   s = s.replace(
     /^(?:\s|<br\s*\/?>|<p>\s*(?:&nbsp;|\u00a0)?\s*<\/p>|<div>\s*(?:&nbsp;|\u00a0)?\s*<\/div>)+/i,
     ""
   );
-  // Collapse long runs of <br>
   s = s.replace(/(?:<br\s*\/?>\s*){3,}/gi, "<br><br>");
   return s;
 }
 
-// --- HTML builder from parsed email JSON ---------------------------------
-
+// -------------------- HTML builder --------------------
 function buildHtmlFromParsed(parsed) {
   const subject = parsed.subject || "(no subject)";
   const from = parsed.from || parsed.headers?.from || "";
   const to = parsed.to || parsed.headers?.to || "";
   const date = parsed.date || parsed.headers?.date || "";
 
-  // Prefer provided HTML; fallback to text
   let bodyHtml = parsed.html || parsed.bodyHtml || null;
   if (!bodyHtml) {
     const t = parsed.text || parsed.textPreview || "";
     bodyHtml = `<pre style="white-space:pre-wrap">${escapeHtml(t)}</pre>`;
   }
 
-  // Map inline attachments by CID → data: URL (tolerate many header variants)
+  // Map CID → data URL
   const cidMap = new Map();
   const norm = (v) => String(v || "").toLowerCase().replace(/[<>\s]/g, "");
   (parsed.attachments || []).forEach((a) => {
-    const b64 =
-      a.dataBase64 || a.base64 || a.data || a.contentBase64 || a.content;
-    const mime =
-      a.contentType || a.mime || a.mimetype || "application/octet-stream";
-
+    const b64 = a.dataBase64 || a.base64 || a.data || a.contentBase64 || a.content;
+    const mime = a.contentType || a.mime || a.mimetype || "application/octet-stream";
     const candidates = [
-      a.cid,
-      a.contentId,
-      a.contentID,
-      a["content-id"],
-      a.headers?.["content-id"],
-      a.headers?.["Content-ID"],
+      a.cid, a.contentId, a.contentID, a["content-id"], a.headers?.["content-id"], a.headers?.["Content-ID"],
     ].filter(Boolean);
-
     for (const c of candidates) {
       const key = norm(c);
-      if (key && b64) {
-        cidMap.set(key, `data:${mime};base64,${b64}`);
-      }
+      if (key && b64) cidMap.set(key, `data:${mime};base64,${b64}`);
     }
   });
+  bodyHtml = bodyHtml.replace(/cid:<?([^">\s]+)>?/gi, (m, raw) => cidMap.get(norm(raw)) || m);
 
-  // Replace cid: links in HTML (normalize both sides before compare)
-  bodyHtml = bodyHtml.replace(/cid:<?([^">\s]+)>?/gi, (m, raw) => {
-    const hit = cidMap.get(norm(raw));
-    return hit || m; // leave untouched if we can't resolve
-  });
-
-  // Normalize top whitespace/spacers to avoid giant top gap
   bodyHtml = normalizeEmailHtml(bodyHtml);
 
+  // NOTE: super-aggressive first-child margin reset + small top padding
   return `<!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
   <title>${escapeHtml(subject)}</title>
   <style>
-    @page { size: A4; margin: 10mm 12mm 12mm 12mm; }  /* tighter top margin */
-    html, body { margin: 0; padding: 0; }
-    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif; color: #111; }
-    .wrapper { padding: 14mm 12mm; }
-    h1 { font-size: 20px; margin: 0 0 8px 0; }
-    .meta { color:#555; margin-bottom:12px; font-size: 12px; }
-    hr { border:0; border-top:1px solid #ddd; margin:16px 0; }
-    img { max-width: 100%; height: auto; }
-    img[width][height]{ height:auto !important; }   /* avoid stretched images */
+    @page { size: A4; margin: 8mm 12mm 12mm 12mm; }
+    html, body { margin:0; padding:0; }
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif; color:#111; }
+    .wrapper { padding: 8mm 12mm 0 12mm; } /* very small top padding */
+    /* Kill giant first-child spacing from Outlook/Word HTML */
+    body > *:first-child,
+    .wrapper > *:first-child,
+    .WordSection1:first-child,
+    #divtagdefaultwrapper:first-child {
+      margin-top: 0 !important;
+      padding-top: 0 !important;
+    }
+    /* Also clamp first 3 blocks' top margins to zero */
+    .wrapper > *:nth-child(-n+3) { margin-top: 0 !important; }
+    /* Tables as spacers shouldn’t blow up height on print */
     table { border-collapse: collapse; }
-    th, td { padding: 6px 8px; }
-    p:empty { display:none; }                        /* hide empty paras */
+    table[role="presentation"] { border-collapse: collapse; }
+    img { max-width:100%; height:auto; }
+    img[width][height]{ height:auto !important; }
+    p:empty { display:none; }
     a[href^="https://eur01.safelinks.protection.outlook.com"] { word-break: break-all; }
   </style>
 </head>
 <body>
   <div class="wrapper">
-    <h1>${escapeHtml(subject)}</h1>
-    <div class="meta">${escapeHtml(from)} → ${escapeHtml(to)} — ${escapeHtml(date)}</div>
-    <hr/>
+    <h1 style="margin:0 0 6px 0; font-size:18px;">${escapeHtml(subject)}</h1>
+    <div class="meta" style="color:#555; margin-bottom:10px; font-size:12px;">
+      ${escapeHtml(from)} → ${escapeHtml(to)} — ${escapeHtml(date)}
+    </div>
+    <hr style="border:0;border-top:1px solid #ddd;margin:12px 0;" />
     ${bodyHtml}
   </div>
 </body>
 </html>`;
 }
 
-// --- HTML → PDF via Puppeteer (loads remote images, no headers) ----------
-
+// -------------------- Puppeteer print with TOP-TRIM preflight --------------------
 async function htmlToPdf(html) {
   const CHROME = detectChromium();
   const browser = await puppeteer.launch({
     executablePath: CHROME,
-    args: ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"]
+    args: ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
   });
   try {
     const page = await browser.newPage();
-    await page.setContent(html, { waitUntil: "networkidle0" }); // let remote images load
+    await page.setContent(html, { waitUntil: "networkidle0" });
+
+    // Inject a preflight script to cut giant spacers at the very top.
+    await page.evaluate(() => {
+      const isVisible = (el) => {
+        const cs = getComputedStyle(el);
+        if (cs.display === "none" || cs.visibility === "hidden") return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height >= 0;
+      };
+      const isTrulyEmpty = (el) => {
+        // no meaningful text and no media
+        const hasText = (el.innerText || "").trim().length > 0;
+        const hasMedia = !!el.querySelector("img, svg, canvas, video, iframe");
+        // tables used as spacers often have no text and no borders
+        return !hasText && !hasMedia;
+      };
+      const clampTopMargin = (el) => {
+        const cs = getComputedStyle(el);
+        const mt = parseFloat(cs.marginTop || "0");
+        if (mt > 60) el.style.marginTop = "0px";
+        const mh = parseFloat(cs.minHeight || "0");
+        if (mh > 200) el.style.minHeight = "0";
+        // very tall line-height on empty block
+        const lh = parseFloat(cs.lineHeight || "0");
+        if (!el.innerText.trim() && lh > 40) el.style.lineHeight = "normal";
+      };
+
+      // Nuke leading <br> runs and empty <p>/<div> blocks
+      const cutLeadingEmpties = () => {
+        let changed = false;
+        while (document.body.firstElementChild) {
+          const el = document.body.firstElementChild;
+          if (!isVisible(el)) { el.remove(); changed = true; continue; }
+          const tag = el.tagName.toLowerCase();
+          if (tag === "br") { el.remove(); changed = true; continue; }
+          // empty or spacer table/div/p near very top
+          const rect = el.getBoundingClientRect();
+          const tall = rect.height > 240; // ~ a big spacer
+          if (["div","p","table","section"].includes(tag) && isTrulyEmpty(el) && (tall || rect.top < 5)) {
+            el.remove(); changed = true; continue;
+          }
+          // stop when first element seems meaningful
+          break;
+        }
+        return changed;
+      };
+
+      // Try a few passes in case of nested wrappers
+      for (let i = 0; i < 4; i++) {
+        const first = document.body.firstElementChild;
+        if (!first) break;
+        clampTopMargin(first);
+        const changed = cutLeadingEmpties();
+        if (!changed) break;
+      }
+
+      // Also clamp first 3 visible blocks’ top margins
+      let seen = 0;
+      for (const el of Array.from(document.body.children)) {
+        if (!isVisible(el)) continue;
+        clampTopMargin(el);
+        seen += 1;
+        if (seen >= 3) break;
+      }
+    });
+
     const pdf = await page.pdf({
       format: "A4",
       printBackground: true,
       displayHeaderFooter: false,
-      margin: { top: "10mm", bottom: "12mm", left: "12mm", right: "12mm" }
+      margin: { top: "8mm", bottom: "12mm", left: "12mm", right: "12mm" },
     });
     return pdf;
   } finally {
@@ -204,27 +236,20 @@ async function htmlToPdf(html) {
   }
 }
 
-// --- Python-backed parsers ------------------------------------------------
-
-// Convert .msg (stdin) → .eml bytes (stdout) via extract-msg
+// -------------------- Python parsers --------------------
 async function msgToEmlBytes(msgBuffer) {
-  const script = process.env.MSG_TO_EML_SCRIPT ||
-    path.join(__dirname, "py", "msg_to_eml.py");
+  const script = process.env.MSG_TO_EML_SCRIPT || path.join(__dirname, "py", "msg_to_eml.py");
   return await runPythonStdIn(script, msgBuffer);
 }
-
-// Parse .eml (stdin) → JSON { subject, from, to, date, html?, text?, attachments[] }
 async function parseEmlToJson(emlBuffer) {
-  const script = process.env.PARSE_EML_SCRIPT ||
-    path.join(__dirname, "py", "parse_eml_minimal.py");
+  const script = process.env.PARSE_EML_SCRIPT || path.join(__dirname, "py", "parse_eml_minimal.py");
   const out = await runPythonStdIn(script, emlBuffer);
   const parsed = JSON.parse(out.toString("utf8"));
   parsed.attachments = Array.isArray(parsed.attachments) ? parsed.attachments : [];
   return parsed;
 }
 
-// --- routes ---------------------------------------------------------------
-
+// -------------------- routes --------------------
 app.get("/healthz", (req, res) => {
   if (!requireAuth(req, res)) return;
   res.json({ ok: true });
@@ -242,25 +267,21 @@ app.post("/convert", async (req, res) => {
 
     const raw = Buffer.from(fileBase64, "base64");
 
-    // 1) Normalize to EML
+    // 1) .msg → .eml if needed
     let emlBytes = raw;
     if (filename.toLowerCase().endsWith(".msg")) {
-      try {
-        emlBytes = await msgToEmlBytes(raw);
-      } catch (e) {
-        return res.status(422).json({ ok: false, error: "msg-to-eml-failed", detail: String(e) });
-      }
+      try { emlBytes = await msgToEmlBytes(raw); }
+      catch (e) { return res.status(422).json({ ok: false, error: "msg-to-eml-failed", detail: String(e) }); }
     }
 
-    // 2) Parse EML → JSON (for HTML composition and cid resolution)
+    // 2) parse .eml to JSON
     const parsed = await parseEmlToJson(emlBytes);
 
-    // Debug: return parsed JSON instead of PDF (helpful during setup)
     if (String(req.query.debug || "") === "1") {
       return res.json({ ok: true, ...parsed });
     }
 
-    // 3) Build HTML and 4) print to PDF
+    // 3) build HTML → 4) print
     const html = buildHtmlFromParsed(parsed);
     const pdf = await htmlToPdf(html);
 
@@ -273,9 +294,6 @@ app.post("/convert", async (req, res) => {
   }
 });
 
-// --- start ---------------------------------------------------------------
-
+// -------------------- start --------------------
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Listening on ${PORT}`);
-});
+app.listen(PORT, "0.0.0.0", () => console.log(`Listening on ${PORT}`));
