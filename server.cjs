@@ -19,7 +19,7 @@ const fetch = require('node-fetch'); // v2 (CommonJS-friendly)
 const { PDFDocument: PDFLib } = require('pdf-lib');
 
 const PORT = process.env.PORT || 8080;
-const SHARED_SECRET = process.env.SHARED_SECRET || process.env.ORDOLUX_SECRET || 'dev-secret';
+const SHARED_SECRET = process.env.ORDOLUX_CONVERTER_SECRET || process.env.ORDOLUX_SECRET || process.env.SHARED_SECRET || 'dev-secret';
 const MAX_BYTES = parseInt(process.env.MAX_BYTES || '26214400', 10); // 25 MB default
 
 const app = express();
@@ -294,7 +294,7 @@ async function parseMsg(buffer) {
   fs.writeFileSync(tmp, buffer);
   try {
     const json = await new Promise((resolve, reject) => {
-      execFile('/opt/pyenv/bin/python3', ['/app/msg_to_json.py', tmp], { timeout: 20000 }, (err, stdout, stderr) => {
+      execFile(process.env.PYTHON || 'python3', [path.join(__dirname, 'msg_to_json.py'), tmp], { timeout: 20000 }, (err, stdout, stderr) => {
         if (err) return reject(new Error(stderr || stdout || String(err)));
         resolve(stdout);
       });

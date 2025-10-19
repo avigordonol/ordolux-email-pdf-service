@@ -8,18 +8,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
-# Create isolated Python env (avoids PEP 668 issues)
+# Create isolated Python env (avoids PEP 668 issues) and ensure it's first in PATH
 RUN python3 -m venv /opt/pyenv
 ENV PATH="/opt/pyenv/bin:${PATH}"
 
 # Python deps used by msg_to_json.py (pin versions for reproducibility)
 RUN pip install --no-cache-dir \
-    extract_msg==0.55.0 \
+    extract-msg==0.41.2 \
     olefile==0.47 \
     compressed-rtf==1.0.6 \
-    chardet==5.2.0 \
-    tzlocal==5.2 \
-    ebcdic==1.1.1
+    chardet==5.2.0
 
 # App directory
 WORKDIR /app
@@ -31,6 +29,7 @@ RUN npm install --omit=dev
 
 # App code
 COPY server.cjs msg_to_json.py ./
+COPY py/ ./py/
 
 # Runtime config
 EXPOSE 8080
