@@ -33,7 +33,6 @@ RUN if [ -f package-lock.json ]; then \
 COPY . .
 
 ENV NODE_ENV=production
-# Chromium path used by server.cjs (optional)
 ENV CHROMIUM_PATH=/usr/bin/chromium
 
 EXPOSE 3000
