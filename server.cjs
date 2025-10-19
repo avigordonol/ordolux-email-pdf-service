@@ -1,3 +1,6 @@
+// server.cjs
+"use strict";
+
 const express = require("express");
 const bodyParser = require("body-parser");
 const fs = require("fs");
@@ -6,25 +9,35 @@ const path = require("path");
 const { spawn, execFile } = require("child_process");
 
 const app = express();
-app.use(bodyParser.json({ limit: "20mb" }));
+app.use(bodyParser.json({ limit: "25mb" }));
+
+// --- config / auth --------------------------------------------------------
 
 const SECRET =
   process.env.ORDOLUX_CONVERTER_SECRET ||
   process.env.CONVERTER_SECRET ||
-  process.env.SHARED_SECRET;
+  process.env.SHARED_SECRET ||
+  "";
 
-// --- utilities ------------------------------------------------------------
+function requireAuth(req, res) {
+  if (!SECRET || req.get("X-Ordolux-Secret") !== SECRET) {
+    res.status(401).json({ ok: false, error: "unauthorized" });
+    return false;
+  }
+  return true;
+}
+
+// --- small helpers --------------------------------------------------------
 
 function execFileP(cmd, args, opts = {}) {
   return new Promise((resolve, reject) => {
     execFile(cmd, args, opts, (err, stdout, stderr) => {
-      if (err) return reject(new Error(stderr || err.message));
+      if (err) return reject(new Error((stderr && String(stderr)) || err.message));
       resolve({ stdout, stderr });
     });
   });
 }
 
-// Run a python script, feed stdin (Buffer), capture stdout (Buffer)
 function runPythonStdIn(scriptPath, stdinBuffer) {
   return new Promise((resolve, reject) => {
     const py = spawn(process.env.PYTHON || "python3", [scriptPath]);
@@ -41,10 +54,6 @@ function runPythonStdIn(scriptPath, stdinBuffer) {
   });
 }
 
-function stripAngle(s = "") {
-  return String(s).replace(/^<|>$/g, "");
-}
-
 function escapeHtml(s = "") {
   return String(s)
     .replace(/&/g, "&amp;")
@@ -52,46 +61,69 @@ function escapeHtml(s = "") {
     .replace(/>/g, "&gt;");
 }
 
-// Build HTML from the parsed email JSON your service already produces
+function stripAngle(s = "") {
+  return String(s).replace(/^<|>$/g, "");
+}
+
+function detectChromium() {
+  const candidates = [
+    process.env.CHROMIUM_PATH,
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+  ].filter(Boolean);
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p)) return p;
+    } catch (_) {}
+  }
+  throw new Error("Chromium not found. Ensure 'chromium' is installed and set CHROMIUM_PATH if needed.");
+}
+
+// --- HTML builder from parsed email JSON ---------------------------------
+
 function buildHtmlFromParsed(parsed) {
   const subject = parsed.subject || "(no subject)";
   const from = parsed.from || parsed.headers?.from || "";
   const to = parsed.to || parsed.headers?.to || "";
   const date = parsed.date || parsed.headers?.date || "";
 
-  // Prefer HTML body; fall back to text
+  // Prefer provided HTML; fallback to text
   let bodyHtml = parsed.html || parsed.bodyHtml || null;
   if (!bodyHtml) {
     const t = parsed.text || parsed.textPreview || "";
     bodyHtml = `<pre style="white-space:pre-wrap">${escapeHtml(t)}</pre>`;
   }
 
-  // Map inline attachments by Content-ID → data: URL
+  // Map inline attachments by CID → data: URL
   const cidMap = new Map();
   (parsed.attachments || []).forEach(a => {
-    const cid = a.contentId || a.cid || a.contentID;
+    const cid = stripAngle(a.contentId || a.cid || a.contentID || "");
     const mime = a.contentType || a.mime || "application/octet-stream";
     const b64 = a.dataBase64 || a.base64 || a.data;
-    if (cid && b64) cidMap.set(stripAngle(cid), `data:${mime};base64,${b64}`);
+    if (cid && b64) cidMap.set(cid, `data:${mime};base64,${b64}`);
   });
 
-  // Replace cid: refs
-  bodyHtml = bodyHtml.replace(/cid:<?([^">]+)>?/g, (m, cid) => {
-    const repl = cidMap.get(cid);
-    return repl || m;
-    });
+  // Replace cid: links in HTML
+  bodyHtml = bodyHtml.replace(/cid:<?([^">\s]+)>?/g, (m, cid) => {
+    return cidMap.get(cid) || m;
+  });
 
-  // Simple, readable layout
   return `<!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
+  <title>${escapeHtml(subject)}</title>
   <style>
-    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif; padding: 24px; }
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif; padding: 24px; color: #111; }
     h1 { font-size: 20px; margin: 0 0 8px 0; }
-    .meta { color:#666; margin-bottom:12px; font-size: 12px; }
+    .meta { color:#555; margin-bottom:12px; font-size: 12px; }
     hr { border:0; border-top:1px solid #ddd; margin:16px 0; }
     img { max-width: 100%; height: auto; }
+    table { border-collapse: collapse; }
+    table, th, td { border: 1px solid #ddd; }
+    th, td { padding: 6px 8px; }
   </style>
 </head>
 <body>
@@ -103,46 +135,69 @@ function buildHtmlFromParsed(parsed) {
 </html>`;
 }
 
-// Use system Chromium to print HTML → PDF (keeps image support excellent)
+// --- HTML → PDF via system Chromium --------------------------------------
+
 async function htmlToPdf(html) {
-  const tmpIn = path.join(os.tmpdir(), `email-${Date.now()}.html`);
-  const tmpOut = path.join(os.tmpdir(), `email-${Date.now()}.pdf`);
-  fs.writeFileSync(tmpIn, html);
+  const tmpDir = os.tmpdir();
+  const inPath = path.join(tmpDir, `email-${Date.now()}.html`);
+  const outPath = path.join(tmpDir, `email-${Date.now()}.pdf`);
+  fs.writeFileSync(inPath, html);
 
-  // Railway (Debian) typically installs Chromium to /usr/bin/chromium
-  const CHROME = process.env.CHROMIUM_PATH || "/usr/bin/chromium";
-
+  const CHROME = detectChromium();
   const args = [
-    "--headless",
+    "--headless=new",            // fallback will be handled below if not supported
     "--no-sandbox",
     "--disable-gpu",
     "--disable-dev-shm-usage",
-    `--print-to-pdf=${tmpOut}`,
-    `file://${tmpIn}`
+    `--print-to-pdf=${outPath}`,
+    `file://${inPath}`
   ];
 
-  await execFileP(CHROME, args);
-  const pdf = fs.readFileSync(tmpOut);
-  fs.unlink(tmpIn, () => {});
-  fs.unlink(tmpOut, () => {});
+  try {
+    await execFileP(CHROME, args);
+  } catch (e) {
+    // Older Chromium may not support --headless=new → try legacy flag
+    const legacyArgs = args.map(a => (a === "--headless=new" ? "--headless" : a));
+    await execFileP(CHROME, legacyArgs);
+  }
+
+  const pdf = fs.readFileSync(outPath);
+  fs.unlink(inPath, () => {});
+  fs.unlink(outPath, () => {});
   return pdf;
+}
+
+// --- Python-backed parsers ------------------------------------------------
+
+// Convert .msg (stdin) → .eml bytes (stdout) via extract-msg
+async function msgToEmlBytes(msgBuffer) {
+  const script = process.env.MSG_TO_EML_SCRIPT ||
+    path.join(__dirname, "py", "msg_to_eml.py");
+  return await runPythonStdIn(script, msgBuffer);
+}
+
+// Parse .eml (stdin) → JSON { subject, from, to, date, html?, text?, attachments[] }
+async function parseEmlToJson(emlBuffer) {
+  const script = process.env.PARSE_EML_SCRIPT ||
+    path.join(__dirname, "py", "parse_eml_minimal.py");
+  const out = await runPythonStdIn(script, emlBuffer);
+  const parsed = JSON.parse(out.toString("utf8"));
+  // normalize attachments array
+  parsed.attachments = Array.isArray(parsed.attachments) ? parsed.attachments : [];
+  return parsed;
 }
 
 // --- routes ---------------------------------------------------------------
 
 app.get("/healthz", (req, res) => {
-  if (req.get("X-Ordolux-Secret") !== SECRET) {
-    return res.status(401).json({ ok: false, error: "unauthorized" });
-  }
-  return res.json({ ok: true });
+  if (!requireAuth(req, res)) return;
+  res.json({ ok: true });
 });
 
-// IMPORTANT: This route now returns application/pdf
+// POST /convert { fileBase64, filename }
 app.post("/convert", async (req, res) => {
   try {
-    if (req.get("X-Ordolux-Secret") !== SECRET) {
-      return res.status(401).json({ ok: false, error: "unauthorized" });
-    }
+    if (!requireAuth(req, res)) return;
 
     const { fileBase64, filename } = req.body || {};
     if (!fileBase64 || !filename) {
@@ -150,29 +205,26 @@ app.post("/convert", async (req, res) => {
     }
 
     const raw = Buffer.from(fileBase64, "base64");
-    let emlBytes = raw;
 
-    // If it's MSG, convert to EML first (stdin → stdout)
+    // 1) Normalize to EML
+    let emlBytes = raw;
     if (filename.toLowerCase().endsWith(".msg")) {
       try {
-        const script = path.join(__dirname, "py", "parse_msg.py");
-        emlBytes = await runPythonStdIn(script, raw);
+        emlBytes = await msgToEmlBytes(raw);
       } catch (e) {
         return res.status(422).json({ ok: false, error: "msg-to-eml-failed", detail: String(e) });
       }
     }
 
-    // ---- YOUR EXISTING PARSE STEP HERE ----
-    // If you already have a parse function that produced the JSON you saw in logs, call it:
-    // const parsed = await parseEmlToJson(emlBytes);
-    // For now, we implement a minimal robust parse via Python 'email' if you don't have one:
-    const parsed = await minimalParseEml(emlBytes);
+    // 2) Parse EML → JSON (for HTML composition and cid resolution)
+    const parsed = await parseEmlToJson(emlBytes);
 
-    // Debug switch to see parsed JSON (optional)
+    // Debug: return parsed JSON instead of PDF (helpful during setup)
     if (String(req.query.debug || "") === "1") {
       return res.json({ ok: true, ...parsed });
     }
 
+    // 3) Build HTML and 4) print to PDF
     const html = buildHtmlFromParsed(parsed);
     const pdf = await htmlToPdf(html);
 
@@ -180,17 +232,14 @@ app.post("/convert", async (req, res) => {
     return res.status(200).send(pdf);
 
   } catch (e) {
-    return res.status(422).json({ ok: false, error: "convert-failed", detail: String(e) });
+    console.error("convert:error", e);
+    return res.status(422).json({ ok: false, error: "convert-failed", detail: String(e?.message || e) });
   }
 });
 
-// Minimal EML parser using Python stdlib (fallback if you don't have a JS parser)
-async function minimalParseEml(bytes) {
-  const script = path.join(__dirname, "py", "parse_eml_minimal.py");
-  const out = await runPythonStdIn(script, bytes);
-  // script prints JSON; parse it
-  return JSON.parse(out.toString("utf8"));
-}
+// --- start ---------------------------------------------------------------
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, "0.0.0.0", () => console.log(`Listening on ${PORT}`));
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Listening on ${PORT}`);
+});
