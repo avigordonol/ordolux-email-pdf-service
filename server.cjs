@@ -7,6 +7,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { spawn, execFile } = require("child_process");
+const puppeteer = require("puppeteer-core");
 
 const app = express();
 app.use(bodyParser.json({ limit: "25mb" }));
@@ -84,7 +85,7 @@ function detectChromium() {
 /**
  * Trim email HTML:
  * - remove leading empty blocks / &nbsp; spacers / long <br> runs
- * - drop 1x1 tracking images and tiny spacers
+ * (do not strip tiny images; some signatures legitimately use tiny logos)
  */
 function normalizeEmailHtml(s) {
   if (!s) return "";
@@ -95,8 +96,6 @@ function normalizeEmailHtml(s) {
   );
   // Collapse long runs of <br>
   s = s.replace(/(?:<br\s*\/?>\s*){3,}/gi, "<br><br>");
-  // Drop 1x1 tracking pixels and tiny spacer images
-  s = s.replace(/<img[^>]*\b(?:width|height)\s*=\s*["']?\s*(?:1|2)\s*["']?[^>]*>/gi, "");
   return s;
 }
 
@@ -115,21 +114,39 @@ function buildHtmlFromParsed(parsed) {
     bodyHtml = `<pre style="white-space:pre-wrap">${escapeHtml(t)}</pre>`;
   }
 
-  // Map inline attachments by CID → data: URL
+  // Map inline attachments by CID → data: URL (tolerate many header variants)
   const cidMap = new Map();
-  (parsed.attachments || []).forEach(a => {
-    const cid = stripAngle(a.contentId || a.cid || a.contentID || "");
-    const mime = a.contentType || a.mime || "application/octet-stream";
-    const b64 = a.dataBase64 || a.base64 || a.data;
-    if (cid && b64) cidMap.set(cid, `data:${mime};base64,${b64}`);
+  const norm = (v) => String(v || "").toLowerCase().replace(/[<>\s]/g, "");
+  (parsed.attachments || []).forEach((a) => {
+    const b64 =
+      a.dataBase64 || a.base64 || a.data || a.contentBase64 || a.content;
+    const mime =
+      a.contentType || a.mime || a.mimetype || "application/octet-stream";
+
+    const candidates = [
+      a.cid,
+      a.contentId,
+      a.contentID,
+      a["content-id"],
+      a.headers?.["content-id"],
+      a.headers?.["Content-ID"],
+    ].filter(Boolean);
+
+    for (const c of candidates) {
+      const key = norm(c);
+      if (key && b64) {
+        cidMap.set(key, `data:${mime};base64,${b64}`);
+      }
+    }
   });
 
-  // Replace cid: links in HTML
-  bodyHtml = bodyHtml.replace(/cid:<?([^">\s]+)>?/gi, (m, cid) => {
-    return cidMap.get(cid) || m;
+  // Replace cid: links in HTML (normalize both sides before compare)
+  bodyHtml = bodyHtml.replace(/cid:<?([^">\s]+)>?/gi, (m, raw) => {
+    const hit = cidMap.get(norm(raw));
+    return hit || m; // leave untouched if we can't resolve
   });
 
-  // Normalize leading whitespace/spacers to avoid giant top gap
+  // Normalize top whitespace/spacers to avoid giant top gap
   bodyHtml = normalizeEmailHtml(bodyHtml);
 
   return `<!doctype html>
@@ -164,37 +181,27 @@ function buildHtmlFromParsed(parsed) {
 </html>`;
 }
 
-// --- HTML → PDF via system Chromium --------------------------------------
+// --- HTML → PDF via Puppeteer (loads remote images, no headers) ----------
 
 async function htmlToPdf(html) {
-  const tmpDir = os.tmpdir();
-  const inPath = path.join(tmpDir, `email-${Date.now()}.html`);
-  const outPath = path.join(tmpDir, `email-${Date.now()}.pdf`);
-  fs.writeFileSync(inPath, html);
-
   const CHROME = detectChromium();
-  const args = [
-    "--headless=new",
-    "--no-sandbox",
-    "--disable-gpu",
-    "--disable-dev-shm-usage",
-    "--print-to-pdf-no-header",     // ⟵ removes Chrome default header/footer
-    `--print-to-pdf=${outPath}`,
-    `file://${inPath}`
-  ];
-
+  const browser = await puppeteer.launch({
+    executablePath: CHROME,
+    args: ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"]
+  });
   try {
-    await execFileP(CHROME, args);
-  } catch (_) {
-    // Older Chromium may not support --headless=new → try legacy flag
-    const legacy = args.map(a => (a === "--headless=new" ? "--headless" : a));
-    await execFileP(CHROME, legacy);
+    const page = await browser.newPage();
+    await page.setContent(html, { waitUntil: "networkidle0" }); // let remote images load
+    const pdf = await page.pdf({
+      format: "A4",
+      printBackground: true,
+      displayHeaderFooter: false,
+      margin: { top: "10mm", bottom: "12mm", left: "12mm", right: "12mm" }
+    });
+    return pdf;
+  } finally {
+    await browser.close();
   }
-
-  const pdf = fs.readFileSync(outPath);
-  fs.unlink(inPath, () => {});
-  fs.unlink(outPath, () => {});
-  return pdf;
 }
 
 // --- Python-backed parsers ------------------------------------------------
