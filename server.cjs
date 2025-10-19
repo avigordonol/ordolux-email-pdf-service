@@ -81,6 +81,25 @@ function detectChromium() {
   throw new Error("Chromium not found. Ensure 'chromium' is installed and set CHROMIUM_PATH if needed.");
 }
 
+/**
+ * Trim email HTML:
+ * - remove leading empty blocks / &nbsp; spacers / long <br> runs
+ * - drop 1x1 tracking images and tiny spacers
+ */
+function normalizeEmailHtml(s) {
+  if (!s) return "";
+  // Trim leading blank blocks (nbsp paragraphs, empty divs, many <br/>)
+  s = s.replace(
+    /^(?:\s|<br\s*\/?>|<p>\s*(?:&nbsp;|\u00a0)?\s*<\/p>|<div>\s*(?:&nbsp;|\u00a0)?\s*<\/div>)+/i,
+    ""
+  );
+  // Collapse long runs of <br>
+  s = s.replace(/(?:<br\s*\/?>\s*){3,}/gi, "<br><br>");
+  // Drop 1x1 tracking pixels and tiny spacer images
+  s = s.replace(/<img[^>]*\b(?:width|height)\s*=\s*["']?\s*(?:1|2)\s*["']?[^>]*>/gi, "");
+  return s;
+}
+
 // --- HTML builder from parsed email JSON ---------------------------------
 
 function buildHtmlFromParsed(parsed) {
@@ -106,9 +125,12 @@ function buildHtmlFromParsed(parsed) {
   });
 
   // Replace cid: links in HTML
-  bodyHtml = bodyHtml.replace(/cid:<?([^">\s]+)>?/g, (m, cid) => {
+  bodyHtml = bodyHtml.replace(/cid:<?([^">\s]+)>?/gi, (m, cid) => {
     return cidMap.get(cid) || m;
   });
+
+  // Normalize leading whitespace/spacers to avoid giant top gap
+  bodyHtml = normalizeEmailHtml(bodyHtml);
 
   return `<!doctype html>
 <html>
@@ -116,21 +138,28 @@ function buildHtmlFromParsed(parsed) {
   <meta charset="utf-8">
   <title>${escapeHtml(subject)}</title>
   <style>
-    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif; padding: 24px; color: #111; }
+    @page { size: A4; margin: 10mm 12mm 12mm 12mm; }  /* tighter top margin */
+    html, body { margin: 0; padding: 0; }
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif; color: #111; }
+    .wrapper { padding: 14mm 12mm; }
     h1 { font-size: 20px; margin: 0 0 8px 0; }
     .meta { color:#555; margin-bottom:12px; font-size: 12px; }
     hr { border:0; border-top:1px solid #ddd; margin:16px 0; }
     img { max-width: 100%; height: auto; }
+    img[width][height]{ height:auto !important; }   /* avoid stretched images */
     table { border-collapse: collapse; }
-    table, th, td { border: 1px solid #ddd; }
     th, td { padding: 6px 8px; }
+    p:empty { display:none; }                        /* hide empty paras */
+    a[href^="https://eur01.safelinks.protection.outlook.com"] { word-break: break-all; }
   </style>
 </head>
 <body>
-  <h1>${escapeHtml(subject)}</h1>
-  <div class="meta">${escapeHtml(from)} → ${escapeHtml(to)} — ${escapeHtml(date)}</div>
-  <hr/>
-  ${bodyHtml}
+  <div class="wrapper">
+    <h1>${escapeHtml(subject)}</h1>
+    <div class="meta">${escapeHtml(from)} → ${escapeHtml(to)} — ${escapeHtml(date)}</div>
+    <hr/>
+    ${bodyHtml}
+  </div>
 </body>
 </html>`;
 }
@@ -145,20 +174,21 @@ async function htmlToPdf(html) {
 
   const CHROME = detectChromium();
   const args = [
-    "--headless=new",            // fallback will be handled below if not supported
+    "--headless=new",
     "--no-sandbox",
     "--disable-gpu",
     "--disable-dev-shm-usage",
+    "--print-to-pdf-no-header",     // ⟵ removes Chrome default header/footer
     `--print-to-pdf=${outPath}`,
     `file://${inPath}`
   ];
 
   try {
     await execFileP(CHROME, args);
-  } catch (e) {
+  } catch (_) {
     // Older Chromium may not support --headless=new → try legacy flag
-    const legacyArgs = args.map(a => (a === "--headless=new" ? "--headless" : a));
-    await execFileP(CHROME, legacyArgs);
+    const legacy = args.map(a => (a === "--headless=new" ? "--headless" : a));
+    await execFileP(CHROME, legacy);
   }
 
   const pdf = fs.readFileSync(outPath);
@@ -182,7 +212,6 @@ async function parseEmlToJson(emlBuffer) {
     path.join(__dirname, "py", "parse_eml_minimal.py");
   const out = await runPythonStdIn(script, emlBuffer);
   const parsed = JSON.parse(out.toString("utf8"));
-  // normalize attachments array
   parsed.attachments = Array.isArray(parsed.attachments) ? parsed.attachments : [];
   return parsed;
 }
