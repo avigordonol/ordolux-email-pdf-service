@@ -1,6 +1,5 @@
 {
   "name": "ordolux-email-pdf-service",
-  "version": "1.0.0",
   "private": true,
   "type": "commonjs",
   "main": "server.cjs",
@@ -8,11 +7,8 @@
     "start": "node server.cjs"
   },
   "dependencies": {
-    "cheerio": "1.0.0-rc.12",
-    "express": "4.19.2",
-    "mailparser": "3.6.7",
-    "node-fetch": "2.6.12",
-    "pdf-lib": "1.17.1",
-    "pdfkit": "0.13.0"
+    "body-parser": "^1.20.2",
+    "express": "^4.19.2",
+    "puppeteer-core": "^22.15.0"
   }
 }
