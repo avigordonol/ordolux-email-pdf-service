@@ -1,4 +1,4 @@
-// server.cjs
+// server.cjs (STABLE — no reply-thread page-break insertion)
 "use strict";
 
 const express = require("express");
@@ -46,6 +46,7 @@ function runPythonStdIn(scriptPath, stdinBuffer) {
 function escapeHtml(s = "") {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
+
 function detectChromium() {
   const cands = [
     process.env.CHROMIUM_PATH,
@@ -110,7 +111,6 @@ function buildHtmlFromParsed(parsed, opts = {}) {
     <hr style="border:0;border-top:1px solid #ddd;margin:12px 0;" />
   `;
 
-  // Wrap the email body so our top-trim can target it precisely.
   return `<!doctype html>
 <html>
 <head>
@@ -120,12 +120,11 @@ function buildHtmlFromParsed(parsed, opts = {}) {
     @page { size: A4; margin: 8mm 12mm 12mm 12mm; }
     html, body { margin:0; padding:0; }
     body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif; color:#111; }
-    .wrapper { padding: 8mm 12mm 0 12mm; } /* small top padding */
-    /* Clamp early margins */
+    .wrapper { padding: 8mm 12mm 0 12mm; }
     body > *:first-child,
     .wrapper > *:first-child { margin-top: 0 !important; padding-top: 0 !important; }
     .wrapper > *:nth-child(-n+3) { margin-top: 0 !important; }
-    table { border-collapse: collapse; }
+    table { border-collapse: collapse; page-break-inside: avoid; }
     table[role="presentation"] { border-collapse: collapse; }
     img { max-width:100%; height:auto; page-break-inside: avoid; }
     img[width][height]{ height:auto !important; }
@@ -144,7 +143,7 @@ function buildHtmlFromParsed(parsed, opts = {}) {
 </html>`;
 }
 
-// -------------------- Puppeteer print with sanitizer + auto-compact --------------------
+// -------------------- Puppeteer print (no reply-page-breaks) --------------------
 async function htmlToPdf(html, opts = {}) {
   const CHROME = detectChromium();
   const browser = await puppeteer.launch({
@@ -155,139 +154,73 @@ async function htmlToPdf(html, opts = {}) {
     const page = await browser.newPage();
     await page.setContent(html, { waitUntil: "networkidle0" });
 
-    // Sanitizer pass (can run twice if we auto-compact)
-    async function sanitizeAndMeasure(compactFlag) {
-      return await page.evaluate((compact) => {
-        const topWindow = 450;          // only police first ~450px
-        const hugeBox  = 320;           // "too tall" threshold
-        const heroClamp = 160;          // cap for hero images near top
-        const body = document.getElementById("email-body") || document.body;
+    // Sanitizer: hide broken imgs, clamp silly tall placeholders, trim leading empties
+    await page.evaluate((compact) => {
+      const topWindow = 450;
+      const hugeBox  = 320;
+      const heroClamp = 160;
+      const body = document.getElementById("email-body") || document.body;
 
-        // 0) Hide broken/blocked images; clamp absurdly tall placeholders
-        document.querySelectorAll("img").forEach(img => {
-          if (!img.complete || img.naturalWidth === 0) {
-            img.style.display = "none";
-          }
-          const h = parseFloat(getComputedStyle(img).height || "0");
-          if (h > 800) { img.style.maxHeight = "300px"; img.style.height = "auto"; }
-        });
+      document.querySelectorAll("img").forEach(img => {
+        if (!img.complete || img.naturalWidth === 0) img.style.display = "none";
+        const h = parseFloat(getComputedStyle(img).height || "0");
+        if (h > 800) { img.style.maxHeight = "300px"; img.style.height = "auto"; }
+      });
 
-        const isVisible = (el) => {
-          const cs = getComputedStyle(el);
-          if (cs.display === "none" || cs.visibility === "hidden") return false;
-          const r = el.getBoundingClientRect();
-          return r.width > 0 && r.height >= 0;
-        };
-        const textLen = (el) => ((el.innerText || "").trim().length);
-        const hasMeaningfulText = (el) => textLen(el) >= 30;
-        const isMostlyMediaOrLinks = (el) => {
-          const txt = (el.innerText || "").trim();
-          const imgs = el.querySelectorAll("img").length;
-          const ifr = el.querySelectorAll("iframe,svg,canvas,video").length;
-          const linksOnly = el.children.length &&
-            Array.from(el.children).every(c => c.tagName && c.tagName.toLowerCase() === "a");
-          return (txt.length < 20) && (imgs + ifr > 0 || linksOnly);
-        };
+      const isVisible = (el) => {
+        const cs = getComputedStyle(el);
+        if (cs.display === "none" || cs.visibility === "hidden") return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height >= 0;
+      };
+      const textLen = (el) => ((el.innerText || "").trim().length);
 
-        // 1) Clamp Exclaimer/Safelinks hero images near the top
-        body.querySelectorAll("img").forEach(img => {
-          const src = (img.getAttribute("src") || "").toLowerCase();
-          const y = img.getBoundingClientRect().top;
-          if (y < topWindow && /exclaimer\.net|safelinks\.protection\.outlook\.com/.test(src)) {
-            img.style.maxHeight = heroClamp + "px";
-            img.style.height = "auto";
-            img.style.marginTop = "0";
-            img.style.paddingTop = "0";
-            const r = img.getBoundingClientRect();
-            if (r.top < 40 && r.height > hugeBox) img.style.display = "none";
-          }
-        });
-
-        // 2) Remove fixed heights / giant paddings / margins on early blocks
-        body.querySelectorAll("table, tr, td, div, section").forEach(el => {
-          const r = el.getBoundingClientRect();
-          if (r.top > topWindow) return;
-          el.removeAttribute("height");
-          const s = el.getAttribute("style") || "";
-          if (/height\s*:/.test(s)) el.setAttribute("style", s.replace(/height\s*:\s*[^;]+;?/gi, ""));
-          const cs = getComputedStyle(el);
-          if (parseFloat(cs.marginTop || "0") > 40) el.style.marginTop = "0";
-          if (parseFloat(cs.paddingTop || "0") > 40) el.style.paddingTop = "0";
-          if (parseFloat(cs.minHeight || "0") > 200) el.style.minHeight = "0";
-          if (r.height > hugeBox && !hasMeaningfulText(el) && isMostlyMediaOrLinks(el)) {
-            el.style.height = "0";
-            el.style.overflow = "hidden";
-            el.style.padding = "0";
-            el.style.marginTop = "0";
-          }
-        });
-
-        // 3) Remove leading <br> runs / empty giants right at the start
-        const cutLeading = () => {
-          let changed = false;
-          while (body.firstElementChild) {
-            const el = body.firstElementChild;
-            if (!isVisible(el)) { el.remove(); changed = true; continue; }
-            if (el.tagName.toLowerCase() === "br") { el.remove(); changed = true; continue; }
-            const r = el.getBoundingClientRect();
-            const emptyish = !hasMeaningfulText(el) && !el.querySelector("img,video,iframe,svg,canvas");
-            if (r.top < 30 && (r.height > hugeBox || emptyish)) {
-              el.remove(); changed = true; continue;
-            }
-            break;
-          }
-          return changed;
-        };
-        for (let i = 0; i < 3; i++) { if (!cutLeading()) break; }
-
-        // 4) Optional compact: nuke first giant image-only block entirely
-        if (compact && body.firstElementChild) {
-          const el = body.firstElementChild;
-          const r = el.getBoundingClientRect();
-          if (r.top < 40 && r.height > hugeBox && textLen(el) < 20 && el.querySelector("img")) {
-            el.remove();
-          }
+      // Clamp top hero images (exclaimer/safelinks)
+      body.querySelectorAll("img").forEach(img => {
+        const src = (img.getAttribute("src") || "").toLowerCase();
+        const y = img.getBoundingClientRect().top;
+        if (y < topWindow && /exclaimer\.net|safelinks\.protection\.outlook\.com/.test(src)) {
+          img.style.maxHeight = heroClamp + "px";
+          img.style.height = "auto";
+          img.style.marginTop = "0";
+          img.style.paddingTop = "0";
+          const r = img.getBoundingClientRect();
+          if (r.top < 40 && r.height > hugeBox) img.style.display = "none";
         }
+      });
 
-        // 5) Page-breaks before reply separators
-        let inserted = 0;
-        const limit = 6; // safety cap
-        const walk = body.querySelectorAll("div, p, table, td, blockquote, section");
-        for (const el of walk) {
-          if (inserted >= limit) break;
-          const t = (el.innerText || "").trim();
-          if (!t) continue;
-          if (/^-----\s*Original Message\s*-----/i.test(t) || /^From:\s*/i.test(t)) {
-            // Insert a page break BEFORE this element
-            const br = document.createElement("div");
-            br.setAttribute("style", "page-break-before: always;");
-            el.parentNode.insertBefore(br, el);
-            inserted++;
-          }
+      // Remove fixed heights / giant paddings / margins on early blocks
+      body.querySelectorAll("table, tr, td, div, section").forEach(el => {
+        const r = el.getBoundingClientRect();
+        if (r.top > topWindow) return;
+        el.removeAttribute("height");
+        const s = el.getAttribute("style") || "";
+        if (/height\s*:/.test(s)) el.setAttribute("style", s.replace(/height\s*:\s*[^;]+;?/gi, ""));
+        const cs = getComputedStyle(el);
+        if (parseFloat(cs.marginTop || "0") > 40) el.style.marginTop = "0";
+        if (parseFloat(cs.paddingTop || "0") > 40) el.style.paddingTop = "0";
+        if (parseFloat(cs.minHeight || "0") > 200) el.style.minHeight = "0";
+        // kill empty giant at very top
+        if (r.top < 30 && r.height > hugeBox && textLen(el) < 20 && !el.querySelector("img,video,iframe,svg,canvas")) {
+          el.style.height = "0";
+          el.style.overflow = "hidden";
+          el.style.padding = "0";
+          el.style.marginTop = "0";
         }
+      });
 
-        // Return first-body-child metrics
+      // Cut leading <br> & empty blocks at very start
+      for (let i = 0; i < 3; i++) {
         const first = body.firstElementChild;
-        const metrics = first ? {
-          firstHeight: first.getBoundingClientRect().height,
-          firstTextLen: textLen(first),
-          hasImg: !!first.querySelector("img")
-        } : { firstHeight: 0, firstTextLen: 0, hasImg: false };
-
-        return metrics;
-      }, !!compactFlag);
-    }
-
-    // First pass with requested compact (or false)
-    const requestedCompact = !!opts.compact;
-    let m = await sanitizeAndMeasure(requestedCompact);
-
-    // Auto-compact fallback if giant empty block persists
-    if (opts.autoCompact !== false && !requestedCompact) {
-      if (m.firstHeight > 350 && m.firstTextLen < 20) {
-        m = await sanitizeAndMeasure(true); // force compact
+        if (!first) break;
+        if (!isVisible(first) || first.tagName.toLowerCase() === "br" || textLen(first) === 0) {
+          first.remove();
+        } else {
+          break;
+        }
       }
-    }
+      // NOTE: Intentionally NO page-break insertion here to avoid blank pages.
+    }, !!opts.compact);
 
     const pdf = await page.pdf({
       format: "A4",
@@ -346,12 +279,12 @@ app.post("/convert", async (req, res) => {
       return res.json({ ok: true, ...parsed });
     }
 
-    // 3) build HTML (honour ?noHeader=1), then 4) print with auto-compact
+    // 3) build HTML (honour ?noHeader=1), then 4) print
     const noHeader = String(req.query.noHeader || "") === "1";
     const html = buildHtmlFromParsed(parsed, { noHeader });
 
     const compact = String(req.query.compact || "") === "1";
-    const pdf = await htmlToPdf(html, { compact, autoCompact: true });
+    const pdf = await htmlToPdf(html, { compact });
 
     res.setHeader("content-type", "application/pdf");
     return res.status(200).send(pdf);
