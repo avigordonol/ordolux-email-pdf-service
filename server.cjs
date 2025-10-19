@@ -1,9 +1,9 @@
+// server.cjs
 "use strict";
 
 const express = require("express");
 const bodyParser = require("body-parser");
 const fs = require("fs");
-const os = require("os");
 const path = require("path");
 const { spawn } = require("child_process");
 const puppeteer = require("puppeteer-core");
@@ -105,7 +105,7 @@ function buildHtmlFromParsed(parsed) {
 
   bodyHtml = normalizeEmailHtml(bodyHtml);
 
-  // NOTE: super-aggressive first-child margin reset + small top padding
+  // Aggressive first-child margin reset + small top padding
   return `<!doctype html>
 <html>
 <head>
@@ -126,7 +126,6 @@ function buildHtmlFromParsed(parsed) {
     }
     /* Also clamp first 3 blocks' top margins to zero */
     .wrapper > *:nth-child(-n+3) { margin-top: 0 !important; }
-    /* Tables as spacers shouldn’t blow up height on print */
     table { border-collapse: collapse; }
     table[role="presentation"] { border-collapse: collapse; }
     img { max-width:100%; height:auto; }
@@ -148,7 +147,7 @@ function buildHtmlFromParsed(parsed) {
 </html>`;
 }
 
-// -------------------- Puppeteer print with TOP-TRIM preflight --------------------
+// -------------------- Puppeteer print with TOP-TRIM + broken-image handling --------------------
 async function htmlToPdf(html) {
   const CHROME = detectChromium();
   const browser = await puppeteer.launch({
@@ -159,7 +158,21 @@ async function htmlToPdf(html) {
     const page = await browser.newPage();
     await page.setContent(html, { waitUntil: "networkidle0" });
 
-    // Inject a preflight script to cut giant spacers at the very top.
+    // 1) Hide broken/blocked images; clamp absurdly tall placeholders
+    await page.evaluate(() => {
+      document.querySelectorAll("img").forEach(img => {
+        if (!img.complete || img.naturalWidth === 0) {
+          img.style.display = "none";
+        }
+        const h = parseFloat(getComputedStyle(img).height || "0");
+        if (h > 500) {
+          img.style.maxHeight = "300px";
+          img.style.height = "auto";
+        }
+      });
+    });
+
+    // 2) Top-trim pass: remove/neutralise giant spacers at the very top
     await page.evaluate(() => {
       const isVisible = (el) => {
         const cs = getComputedStyle(el);
@@ -168,10 +181,8 @@ async function htmlToPdf(html) {
         return r.width > 0 && r.height >= 0;
       };
       const isTrulyEmpty = (el) => {
-        // no meaningful text and no media
         const hasText = (el.innerText || "").trim().length > 0;
         const hasMedia = !!el.querySelector("img, svg, canvas, video, iframe");
-        // tables used as spacers often have no text and no borders
         return !hasText && !hasMedia;
       };
       const clampTopMargin = (el) => {
@@ -180,32 +191,29 @@ async function htmlToPdf(html) {
         if (mt > 60) el.style.marginTop = "0px";
         const mh = parseFloat(cs.minHeight || "0");
         if (mh > 200) el.style.minHeight = "0";
-        // very tall line-height on empty block
         const lh = parseFloat(cs.lineHeight || "0");
         if (!el.innerText.trim() && lh > 40) el.style.lineHeight = "normal";
+        const pt = parseFloat(cs.paddingTop || "0");
+        if (pt > 60) el.style.paddingTop = "0px";
       };
 
-      // Nuke leading <br> runs and empty <p>/<div> blocks
       const cutLeadingEmpties = () => {
         let changed = false;
         while (document.body.firstElementChild) {
           const el = document.body.firstElementChild;
           if (!isVisible(el)) { el.remove(); changed = true; continue; }
-          const tag = el.tagName.toLowerCase();
-          if (tag === "br") { el.remove(); changed = true; continue; }
-          // empty or spacer table/div/p near very top
+          if (el.tagName.toLowerCase() === "br") { el.remove(); changed = true; continue; }
           const rect = el.getBoundingClientRect();
-          const tall = rect.height > 240; // ~ a big spacer
-          if (["div","p","table","section"].includes(tag) && isTrulyEmpty(el) && (tall || rect.top < 5)) {
+          const tall = rect.height > 240; // ≈ large header spacer
+          if (["div","p","table","section"].includes(el.tagName.toLowerCase()) &&
+              isTrulyEmpty(el) && (tall || rect.top < 5)) {
             el.remove(); changed = true; continue;
           }
-          // stop when first element seems meaningful
-          break;
+          break; // first meaningful thing reached
         }
         return changed;
       };
 
-      // Try a few passes in case of nested wrappers
       for (let i = 0; i < 4; i++) {
         const first = document.body.firstElementChild;
         if (!first) break;
@@ -214,7 +222,6 @@ async function htmlToPdf(html) {
         if (!changed) break;
       }
 
-      // Also clamp first 3 visible blocks’ top margins
       let seen = 0;
       for (const el of Array.from(document.body.children)) {
         if (!isVisible(el)) continue;
@@ -224,11 +231,12 @@ async function htmlToPdf(html) {
       }
     });
 
+    // 3) Print with tight top margin
     const pdf = await page.pdf({
       format: "A4",
       printBackground: true,
       displayHeaderFooter: false,
-      margin: { top: "8mm", bottom: "12mm", left: "12mm", right: "12mm" },
+      margin: { top: "6mm", bottom: "12mm", left: "12mm", right: "12mm" },
     });
     return pdf;
   } finally {
